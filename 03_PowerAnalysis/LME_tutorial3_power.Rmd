@@ -1,0 +1,915 @@
+---
+title: "Power Analyses for Trial-level LMEs of ERP Data"
+subtitle: "Simulation-based power for two study designs"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+---
+
+```{r setup, include = FALSE}
+options(width = 120)  # wide enough that VarCorr() and summary() tables don't wrap
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+```
+
+# Overview
+
+G\*Power-style formulas assume one source of variability. A trial-level LME of
+ERP data has many sources of variability: participants, stimuli, random slopes, and
+large single-trial noise, plus unequal trial counts after artifact rejection.
+The most flexible and accurate way to estimate power for ERP designs is to **simulate data**.
+
+This tutorial works through two study designs:
+
+| Design | What it shows |
+|---|---|
+| **1. The N400 in dyslexic and typical adults, starting from published results** | How many participants for each research question? Planning for the smallest effect of interest (SESOI), how individual differences in the effect (random slopes) cost power, and how many participants to recruit when trials are lost |
+| **2. Face emotion (Nc), with high trial-to-trial variability and data loss** | How trials per condition, artifact rejection, and the number of stimuli (actors) trade off |
+
+Design 1 is modeled after the ERP CORE N400 word pair task (Kappenman et al.,
+2021), with the group difference taken from a meta-analysis of N400 studies in
+dyslexia (Basma et al., 2024). Design 2 uses the
+face-emotion paradigm from Example 1 (`LME_ex1_emotionfaces.Rmd`): children view
+angry and happy faces from several actors. In both studies, our outcome is single-trial mean
+amplitude.
+
+> **This tutorial relies on the `mixedpower` package and the materials by
+> Kumle, Võ & Draschkow, and our approach follows their tutorial paper.** 
+> Their **power notebooks**, <https://lkumle.github.io/power_notebooks/>, walk through
+> more scenarios step by step (a well-powered starting dataset, varying the number of
+> stimuli, building a model from strong a priori assumptions, and a GLMM).
+
+# Setup
+
+```{r packages}
+# install.packages(c("tidyverse", "lme4", "lmerTest", "faux"))
+# mixedpower is not on CRAN:
+# install.packages("remotes")
+# remotes::install_github("DejanDraschkow/mixedpower")
+
+library(tidyverse)  # data management
+library(lme4)       # lmer(); mixedpower needs lme4 model objects
+library(lmerTest)   # Satterthwaite p-values 
+library(faux)       # simulating LME designs
+library(mixedpower) # simulation-based power for mixed models
+```
+
+# Power basics
+
+## What is power?
+
+**Statistical power** is the probability that a study detects an effect
+*if that effect really exists in the population*: power = 1 − β, where β is the Type II
+(false-negative) error rate. In plain terms: "if there is an effect of a
+certain size, what is the probability that my study will detect it?"
+80% is the conventional power threshold used for sample size calculations in psychology.
+
+Power depends on:
+
+- the **effect size** (e.g., the related vs. unrelated N400 difference),
+- the **number of participants** and the **number of trials/stimuli**,
+- the **variability** in the data(between-subject, between-stimulus, random slopes,
+  and single-trial noise)
+- the **alpha level**
+
+## Why simulate?
+
+There's no power formula for LMEs. The one analytic solution that I'm aware of (Westfall et al., 2014) only covers a single two-level fixed effect. For that case, the Westfall, Kenny & Judd (2014) app has a nice power calculation interface: <https://jakewestfall.shinyapps.io/crossedpower/>. For anything
+more complex (more conditions, continuous predictors like trial number,
+covariates, repeated presentations of each stimulus, unequal trial counts),
+the alternative is **simulation**:
+
+Every simulation-based power analysis follows three steps:
+
+1. **Simulate** a new dataset from a model with known effects.
+2. **Fit** the planned LME to that dataset and test for significance.
+3. **Repeat** many times; power = the proportion of significant results.
+
+Doing this across a range of sample sizes gives a **power curve**.
+
+We'll use the `mixedpower` package (Kumle, Võ, & Draschkow, 2018), which
+runs these three steps for every fixed effect at once and spreads the
+simulations across your computer's cores. 
+
+## Where do the simulation parameters come from?
+
+Kumle et al. (2021) describe three scenarios:
+
+1. **You have data from a previous study** (e.g., your own pilot, or open data
+   from a published paper). Fit your planned model to it and simulate from
+   that model.
+2. **You want to vary more than one random variable**, e.g., the number
+   of participants *and* the number of stimuli or trials (`R2power()`).
+3. **You have no data**, so you build the data and model from scratch using
+   strong, justified assumptions about every effect and variance component.
+
+**Design 1 is Scenario 1, starting from published results.** We're planning
+a new N400 study modeled after ERP CORE, with the group difference taken from
+a meta-analysis:
+
+- **ERP CORE (Kappenman et al., 2021):** 40 typical adults completed a word
+  pair judgment task. On each trial, a prime word is followed by a target
+  word, and participants judge whether the two words are related. Each
+  participant saw 60 related and 60 unrelated pairs. The N400 (mean amplitude
+  at CPz, 300–500 ms) was more negative for unrelated targets:
+  unrelated − related = **−7.61 µV** (SD across participants = 3.27 µV;
+  *d~z~* = 2.33; N = 39 after exclusions).
+- **Basma, Savage & Bertone (2024):** a meta-analysis of 20 studies found
+  that the N400 differs between typical and dyslexic readers by
+  **Hedges' *g* = 0.66**. We use it to size the group difference.
+
+We don't have trial-level data from these studies, so we will **simulate a pilot
+dataset from their published numbers**. Then we will treat our simulation as pilot data and let `mixedpower` simulate new studies from it. 
+
+| Parameter | Value | Where it comes from |
+|---|---|---|
+| N400 effect, typical readers (unrelated − related) | −7.61 µV | Kappenman et al. (2021) |
+| Group difference in the N400 effect (smaller for dyslexic readers) | 2.2 µV | *g* = 0.66 (Basma et al., 2024) × 3.27 µV |
+| Trials per participant | 60 related + 60 unrelated target words | Kappenman et al. (2021) |
+| Single-trial noise SD | 11.5 µV | Derived (see below) |
+| Participants' N400 effect, random slope SD | 2.5 µV | Derived (see below) |
+| Mean amplitude, related targets | 2 µV | Assumed (doesn't affect power) |
+| Participants' overall amplitude, random intercept SD | 3 µV | Assumed |
+| Target words, random intercept SD | 1.5 µV | Assumed |
+
+**Two values are derived from the published numbers:**
+
+- **Single-trial noise.** ERP CORE reports the noise in each participant's
+  averaged ERP (about 1.5 µV; Kappenman et al., 2021).
+  Averaging *n* trials divides the single-trial noise SD by √*n*, so with about
+  60 trials per condition, single trials have an SD of about
+  1.5 × √60 ≈ 11.5 µV.
+- **Individual differences in the N400 effect.** Each participant's averaged
+  N400 effect has at least two sources of variability: real differences between participants (the random slope) and leftover noise from averaging 60 trials per condition
+  (11.5² × (1/60 + 1/60) ≈ 4.4 µV²). Subtracting that noise from the published
+  variance (3.27² ≈ 10.7 µV²) leaves about 6.3 µV², an SD of about **2.5 µV**.
+
+# Design 1: The N400 in dyslexic and typical adults
+
+What sample size do we need to detect a significant difference across these two research questions (at power = .8)?:
+
+1. **The N400 effect:** is the N400 more negative for unrelated than related
+   targets? (a within-participant effect)
+2. **Condition × Group:** is the N400 effect smaller in dyslexic than typical
+   readers? (a between-participant difference in a within-participant effect)
+
+We will use effects coding for both predictors:
+
+- `Condition_e`: related = −0.5, unrelated = +0.5. Its coefficient is the
+  N400 effect (unrelated − related), averaged over the two groups.
+- `Group_e`: typical = −0.5, dyslexic = +0.5.
+- `Condition_e:Group_e`: the dyslexic group's N400 effect minus the typical
+  group's. A positive value means a smaller (less negative) N400 effect in
+  dyslexic readers.
+
+## Step 1: Simulate the "pilot" dataset and fit the planned model
+
+`mixedpower` requires: a fitted `lme4` model and the data it was
+fit to. It then simulates new outcome values from that model
+(`lme4::simulate()`) and refits the model to each new dataset.
+
+Two details matter for `mixedpower`:
+
+- The variable we'll vary (participants, `simvar`) **must be numeric**, so
+  we use `SubjectNum` = 1, 2, 3, … instead of IDs like `"S001"`.
+- Fit the model with `lme4::lmer()`. `mixedpower` refits models with `lme4`
+  and judges significance from **t-values**, not lmerTest p-values. Kumle et al.
+  recommend |t|>2 as the significance threshold. 
+
+```{r power-pilot}
+# Simulate one N400 dataset from the published numbers
+# (half the participants are dyslexic readers; every participant sees 60 target words
+#  in a related pair and in an unrelated pair, 120 trials in all)
+simulate_n400_data <- function(n_subjects, n_items = 60,
+                               amp_related = 2,          # µV, related targets (assumed)
+                               n400_typical = -7.61,     # unrelated - related, typical readers (ERP CORE)
+                               group_diff = 2.2,         # dyslexic N400 effect - typical N400 effect
+                               subject_sd = 3,           # participants' overall amplitude (assumed)
+                               slope_sd = 2.5,           # participants' N400 effect (derived)
+                               item_sd = 1.5,            # target words (assumed)
+                               trial_noise_sd = 11.5) {  # single-trial noise (derived)
+
+  subjects <- tibble(SubjectNum = 1:n_subjects,
+                     Group = rep(c("Typical", "Dyslexic"), length.out = n_subjects),
+                     subj_intercept = rnorm(n_subjects, 0, subject_sd),
+                     subj_slope = rnorm(n_subjects, 0, slope_sd))
+  items <- tibble(ItemNum = 1:n_items, item_intercept = rnorm(n_items, 0, item_sd))
+
+  expand_grid(SubjectNum = 1:n_subjects, ItemNum = 1:n_items,
+              Condition = c("Related", "Unrelated")) %>%
+    left_join(subjects, by = "SubjectNum") %>%
+    left_join(items, by = "ItemNum") %>%
+    mutate(
+      Condition_e = if_else(Condition == "Unrelated", 0.5, -0.5),
+      Group_e     = if_else(Group == "Dyslexic", 0.5, -0.5),
+      n400_effect = n400_typical + group_diff * (Group == "Dyslexic") + subj_slope,
+      MeanAmp = amp_related + n400_effect * (Condition == "Unrelated") +
+        subj_intercept + item_intercept + rnorm(n(), 0, trial_noise_sd)
+    ) %>%
+    select(SubjectNum, Group, Group_e, ItemNum, Condition, Condition_e, MeanAmp)
+}
+
+set.seed(2026)
+pilot_data <- simulate_n400_data(n_subjects = 40)
+
+# The planned model: N400 effect, group, and their interaction;
+# participants differ in overall amplitude and in their N400 effect; target words differ
+pilot_model <- lme4::lmer(MeanAmp ~ Condition_e * Group_e +
+                            (1 + Condition_e | SubjectNum) + (1 | ItemNum),
+                          data = pilot_data,
+                          control = lmerControl(optimizer = "bobyqa"))
+summary(pilot_model)$coefficients
+VarCorr(pilot_model)
+```
+
+Let's plot our pilot data: 
+
+```{r pilot-plot, fig.width=7, fig.height=4.5}
+pilot_means <- pilot_data %>%
+  group_by(SubjectNum, Group, Condition) %>%
+  summarise(MeanAmp = mean(MeanAmp), .groups = "drop") %>%
+  mutate(Group = factor(Group, levels = c("Typical", "Dyslexic")))
+
+group_means <- pilot_means %>%
+  group_by(Group, Condition) %>%
+  summarise(se = sd(MeanAmp) / sqrt(n()), MeanAmp = mean(MeanAmp), .groups = "drop")
+
+ggplot(pilot_means, aes(Condition, MeanAmp, colour = Group)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.5),
+             alpha = 0.35, size = 1.8) +
+  geom_line(data = group_means, aes(group = Group), linewidth = 1.2,
+            position = position_dodge(width = 0.5)) +
+  geom_pointrange(data = group_means, aes(ymin = MeanAmp - se, ymax = MeanAmp + se),
+                  size = 0.8, linewidth = 1.2, position = position_dodge(width = 0.5)) +
+  scale_colour_manual(values = c(Typical = "#3D6080", Dyslexic = "#D55E00")) +
+  labs(x = NULL, y = "Mean amplitude at CPz, 300-500 ms (µV)", colour = NULL,
+       title = "Simulated pilot: the N400 effect in each group",
+       subtitle = "Faint points = participant means; large points = group means ± 1 SE") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+Both groups show an N400 effect (more negative for unrelated targets), and the
+line is less steep for dyslexic readers (showing the Condition × Group interaction we want to detect).
+
+In the population we simulated, the N400 effect averaged over groups is
+−7.61 + 2.2 / 2 ≈ −6.5 µV, and the Condition × Group interaction is 2.2 µV.
+The pilot estimated
+`r round(fixef(pilot_model)["Condition_e"], 2)` µV and
+`r round(fixef(pilot_model)["Condition_e:Group_e"], 2)` µV.
+
+## Step 2: Choose the smallest effect size of interest (SESOI)
+
+The **smallest effect size of interest (SESOI)** is the smallest effect that
+would still matter to you, theoretically or practically. If the true effect
+were smaller than that, you wouldn't care whether your study detected it. 
+
+**Why would we want to be powered to detect an effect size smaller than in the published literature?**
+
+Without a principled smallest effect, Kumle et al. (2021)
+suggest planning for an effect about **15% smaller** than your best estimate,
+because estimates from small or published studies tend to be inflated:
+
+- **N400 effect:** 15% smaller than −6.5 µV, so **−5.5 µV**.
+- **Condition × Group:** 15% smaller than 2.2 µV, so **1.9 µV**.
+
+## Step 3: Run the power simulation
+
+```{r power-mixedpower, cache=TRUE, results='hide'}
+# results='hide' silences mixedpower's step-by-step progress messages
+# SESOI needs one value per coefficient (including the intercept), in the
+# order of fixef(pilot_model); we only change the two effects of interest
+sesoi <- fixef(pilot_model)
+sesoi["Condition_e"]         <- -5.5   # N400 effect (unrelated - related), µV
+sesoi["Condition_e:Group_e"] <- 1.9    # dyslexic minus typical N400 effect, µV
+
+power_results <- mixedpower(
+  model          = pilot_model,
+  data           = pilot_data,
+  fixed_effects  = c("Condition_e", "Group_e"),  # column names, not coefficient names
+  simvar         = "SubjectNum",                  # the random variable to vary
+  steps          = c(10, 20, 40, 60, 80, 100, 120, 160),  # total participants (half per group)
+  critical_value = 2,                             # |t| > 2 counts as significant (~ alpha = .05)
+  n_sim          = 100,                           # use 1000+ for a real power analysis
+  SESOI          = sesoi,                         # simulate our smallest effects of interest
+  databased      = TRUE                           # and the effects estimated from the pilot
+)
+```
+
+```{r power-results-table}
+power_results
+```
+
+- Each row is one fixed effect; each column is one sample size (total
+  participants). `mode = "databased"` uses the effects estimated from the
+  pilot data; `mode = "SESOI"` uses the smallest effects of interest we
+  supplied.
+- We ran `n_sim = 100` so that the tutorial would knit in under 2 hours. Kumle et al. (2021) recommend **at least 1,000** simulations (the package default) for a real power
+  analysis to achieve stable results.
+- `mixedpower()` uses all but one of your cores (set `maxCores` to limit
+  it) and saves a copy of the results to `output_powersismulation.Rda` in
+  your working directory.
+
+## Step 4: Plot the power curves
+
+`mixedpower` has a built-in `multiplotPower(power_results)`:
+```{r multiplotpower_results}
+multiplotPower(power_results)
+```
+
+
+Here is a custom plot of just the effects we care about that is a little is easier to read:
+
+```{r power-curve-plot, fig.width=9}
+power_long <- power_results %>%
+  filter(effect %in% c("Condition_e", "Condition_e:Group_e")) %>%
+  pivot_longer(cols = -c(mode, effect), names_to = "n_subjects",
+               values_to = "power") %>%
+  mutate(n_subjects = as.numeric(n_subjects),
+         effect = recode(effect,
+                         Condition_e = "N400 effect (unrelated − related)",
+                         `Condition_e:Group_e` = "Condition × Group (dyslexic vs. typical)"),
+         mode = recode(mode,
+                       databased = "Pilot estimate",
+                       SESOI     = "Smallest effect of interest (SESOI)"))
+
+ggplot(power_long, aes(x = n_subjects, y = power, color = mode)) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", color = "grey40") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ effect) +
+  scale_color_manual(values = c("#3D6080", "#D55E00")) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(title = "Power for our two research questions",
+       subtitle = "60 trials per condition; half the participants in each group",
+       x = "Number of participants (total)", y = "Power", color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+How to use the power simulations to plan for your study:
+
+- **Plan sample size based on the effect that needs the most power (interaction).** The N400 effect is large and compared within each participant on every trial, so it needs very few participants. The group difference (i.e., the interaction effect) is a comparison
+  *between* people, so it's tested against how much participants differ in
+  their N400 effect.
+- Build in additional participants to account for **expected attrition rate**, or specify a **stopping rule** (e.g., you will stop running participants once you've collected X participants with usable EEG data). 
+
+## What if participants differ more or less in their N400 effect?
+
+The random slope SD (2.5 µV) was derived from one published SD, so it's
+uncertain. Here we compare three values in a realistic range: half our
+estimate (1.25 µV), our estimate from ERP CORE (2.5 µV), and one and a half times
+our estimate (3.75 µV).
+
+```{r power-slopes, cache=TRUE, results='hide'}
+run_slope_power <- function(slope_sd) {
+  set.seed(2026)
+  pilot_data_slopes <- simulate_n400_data(n_subjects = 40, slope_sd = slope_sd)
+  pilot_model_slopes <- lme4::lmer(MeanAmp ~ Condition_e * Group_e +
+                                     (1 + Condition_e | SubjectNum) + (1 | ItemNum),
+                                   data = pilot_data_slopes,
+                                   control = lmerControl(optimizer = "bobyqa"))
+  mixedpower(model = pilot_model_slopes, data = pilot_data_slopes,
+             fixed_effects = c("Condition_e", "Group_e"),
+             simvar = "SubjectNum", steps = c(20, 40, 80, 120, 160, 200),
+             critical_value = 2, n_sim = 100,
+             SESOI = sesoi,                  # same smallest effects of interest as before
+             databased = FALSE) %>%
+    mutate(model = paste0("Random slope SD = ", slope_sd, " µV"))
+}
+
+power_results_slopes <- map_dfr(c(1.25, 2.5, 3.75), run_slope_power)
+```
+
+```{r power-slopes-plot}
+power_results_slopes %>%
+  filter(effect == "Condition_e:Group_e") %>%
+  pivot_longer(cols = -c(mode, effect, model), names_to = "n_subjects",
+               values_to = "power", values_drop_na = TRUE) %>%
+  mutate(n_subjects = as.numeric(n_subjects),
+         model = fct_inorder(model)) %>%   # keep legend in the order above
+  ggplot(aes(x = n_subjects, y = power, color = model)) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", color = "grey40") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("#9CAF88", "#3D6080", "#D55E00")) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(title = "Individual differences in the N400 effect cost power",
+       subtitle = "Condition × Group at its SESOI (1.9 µV); 60 trials per condition",
+       x = "Number of participants (total)", y = "Power", color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+Single-trial noise "averages out" as you add trials (the model has a better estimate of each participant's mean), but differences *between participants* only average out as you add participants. Assumptions about random slopes can matter a lot in calculating power/sample size! 
+
+## Accounting for data loss: how many participants do you need to recruit?
+
+So far, every participant contributed all 60 trials per condition. In real
+ERP data, trials are lost to artifacts such as blinks, movement, and muscle
+tension, and participants keep different numbers of trials. How many
+participants do you need if each one keeps only 10, 20, 30, 45, or 60 usable
+trials per condition?
+
+Each simulated participant starts with all 60 trials per condition, and we keep a random subset of *k* trials per condition. We power the group difference (Condition × Group) at
+its SESOI, and repeat the whole thing for the three amounts of between-participant
+variability in the N400 effect (random slope SD = 1.25, 2.5, and 3.75 µV, as in the
+last section).
+
+```{r power-trials, cache=TRUE}
+# One simulated study: simulate, keep k trials per participant and condition, fit, test
+sim_once_trials <- function(n_subjects, trials_per_condition, slope_sd) {
+  dat <- simulate_n400_data(n_subjects, group_diff = sesoi[["Condition_e:Group_e"]],
+                            slope_sd = slope_sd) %>%
+    group_by(SubjectNum, Condition) %>%
+    slice_sample(n = trials_per_condition) %>%   # trial loss
+    ungroup()
+  fit <- suppressMessages(suppressWarnings(
+    lme4::lmer(MeanAmp ~ Condition_e * Group_e +
+                 (1 + Condition_e | SubjectNum) + (1 | ItemNum), data = dat,
+               control = lmerControl(optimizer = "bobyqa"))))
+  abs(coef(summary(fit))["Condition_e:Group_e", "t value"]) > 2   # same criterion as mixedpower
+}
+
+trial_grid <- expand_grid(slope_sd = c(1.25, 2.5, 3.75),
+                          trials_per_condition = c(10, 20, 30, 45, 60),
+                          n_subjects = c(20, 40, 60, 80, 120, 160, 200))
+
+# Run the simulations in parallel (one simulation per core at a time)
+n_sims <- 100   # use 1000+ for a real power analysis
+cl <- parallel::makeCluster(max(1, parallel::detectCores() - 1))
+parallel::clusterEvalQ(cl, suppressMessages({library(tidyverse); library(lme4)}))
+parallel::clusterExport(cl, c("simulate_n400_data", "sim_once_trials", "sesoi"))
+parallel::clusterSetRNGStream(cl, 2026)
+trial_grid$power <- sapply(seq_len(nrow(trial_grid)), function(i) {
+  mean(parallel::parSapply(cl, seq_len(n_sims), function(s, n, k, sd) sim_once_trials(n, k, sd),
+                           n = trial_grid$n_subjects[i],
+                           k = trial_grid$trials_per_condition[i],
+                           sd = trial_grid$slope_sd[i]))
+})
+parallel::stopCluster(cl)
+```
+
+```{r power-trials-plot, fig.width=10, fig.height=4.8}
+trial_grid %>%
+  mutate(trials = factor(paste(trials_per_condition, "trials"),
+                         levels = paste(c(10, 20, 30, 45, 60), "trials")),
+         slope = paste0("Random slope SD = ", slope_sd, " µV")) %>%
+  ggplot(aes(x = n_subjects, y = power, color = trials)) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", color = "grey40") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ slope) +
+  scale_color_viridis_d(option = "C", end = 0.85, direction = -1) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(title = "Usable trials per participant vs. number of participants",
+       subtitle = "Condition × Group at its SESOI (1.9 µV); each panel assumes a different amount of between-participant variability",
+       x = "Number of participants (total)", y = "Power",
+       color = "Usable trials per condition") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+# Participants needed for 80% power, by usable trials per condition
+# (linear interpolation between the sample sizes we simulated; "> 200" = never reached 80%)
+n_for_80 <- function(n, power) {
+  if (power[1] >= .8) return(paste0("≤ ", n[1]))
+  i <- which(power >= .8)[1]
+  if (is.na(i)) return(paste0("> ", max(n)))
+  as.character(ceiling(n[i - 1] + (.8 - power[i - 1]) / (power[i] - power[i - 1]) * (n[i] - n[i - 1])))
+}
+n_needed <- trial_grid %>%
+  arrange(slope_sd, trials_per_condition, n_subjects) %>%
+  group_by(slope_sd, trials_per_condition) %>%
+  summarise(n_80 = n_for_80(n_subjects, power), .groups = "drop") %>%
+  pivot_wider(names_from = slope_sd, values_from = n_80, names_prefix = "Slope SD = ")
+knitr::kable(n_needed, col.names = c("Usable trials per condition", paste("Slope SD =", c(1.25, 2.5, 3.75), "µV")),
+             caption = "Participants needed (total) for 80% power")
+```
+
+What to notice:
+
+- **In this design, fewer usable trials means more participants**, especially at very low trial counts (going from 10 to 20 usable trials saves more participants than going from 45 to 60).
+- **How much trials help depends on how much participants differ.** As
+  participants differ more in their N400 effect (middle and right panels),
+  the curves move closer together: the part of the variability that comes
+  from differences between participants only shrinks when you add more participants. 
+- **Plan your power using trial counts you expect to have in your sample** (not the number presented). If participants in your population typically keep about 30 of 60
+  trials per condition, read the power off the 30-trial curve.
+- For simplicity, every participant here keeps exactly *k* trials, lost at
+  random. In your own simulation, you can let the number kept vary across
+  participants or groups.
+
+## What this simulation leaves out
+
+To keep Design 1 simple, we left out two things that real ERP data often have:
+
+- **Habituation.** Every simulated trial has the same expected amplitude,
+  whether it comes early or late in the session. Many components (e.g., the
+  Nc or P300) habituate, becoming smaller across repeated presentations. If
+  yours does, simulate that change and include presentation number in the
+  model you power.
+- **Systematic missing data.** Trials here are lost completely at random.
+  In real data, trials are often lost more toward the end of a session or more often in one group. When loss is related to trial number/time on task or group, it can bias estimates &
+  reduce power.
+
+**What other study design aspects would you consider including in this
+simulation, or in a simulated power analysis you are planning?**
+
+---
+
+# Design 2: A study with high trial-to-trial variability
+
+Design 2 is modeled after the preschool face-emotion study in Heise et al.
+(2022): 3- to 6-year-olds passively viewed faces of several actors showing
+different emotions, and we measured the Nc (central electrodes, about
+300–600 ms). Each actor showed each emotion 10 times, and after artifact
+rejection children kept about 27 of 50 trials per condition (SD ≈ 11), so
+roughly 45% of trials were lost.
+
+**Research question:** is the Nc more negative for angry than for happy
+faces?
+
+Unlike Design 1, here **trial-to-trial noise is large and children differ
+only a little in their emotion effect**. This pattern can describe many EEG designs, including research with infants and young children, clinical samples, and small components with a low signal-to-noise ratio. When trial-to-trial variability is high, but participants show the same relation between the predictor and mean amplitude, extra trials increase power (DeBolt et al., 2020). Instead of asking only "how many
+participants?", Design 2 asks how **trials per condition**, **artifact
+rejection**, and the **number of stimuli** trade off.
+
+Design 2 also addresses one limitation of Design 1: the Nc **habituates**.
+Amplitude becomes 0.5 µV less negative with each presentation of an
+actor × emotion (presentation number 1–10). In Heise et al. (2022), the
+preschoolers' Nc habituated by 0.44 µV per presentation; we rounded to 0.5 µV
+for this simulation. The planned model includes presentation number as a covariate.
+
+## The data-generating model
+
+The model we plan to fit is
+
+```
+amp ~ emotion_e + PresentNum_gmc + (1 + emotion_e | subj_id) + (1 | actor_id)
+```
+
+```{r parameters}
+params <- list(
+  # design
+  n_subj     = 30,     # participants
+  n_actor    = 5,      # actors (stimuli); each shows both emotions (Heise et al., 2022)
+  n_rep      = 10,     # presentations of each actor x emotion -> 50 trials/condition
+  # fixed effects (microvolts)
+  b0         = -10,    # grand-mean Nc amplitude
+  b_emotion  = -2,     # angry - happy (angry more negative); our SESOI-sized effect
+  b_present  = 0.5,    # habituation: amplitude becomes less negative with each presentation of a face
+  # random effects (SDs, microvolts)
+  subj_int   = 5,      # participants differ in overall amplitude
+  subj_slope = 1,      # ...and only a little in the size of their emotion effect
+  subj_cor   = -0.2,   # correlation between subject intercepts and slopes
+  actor_int  = 2,      # some actors elicit larger Nc than others
+  actor_slope = 0,     # actors differ in their emotion effect (0 here; used in Part D)
+  sigma      = 20,     # single-trial noise (within-person SD): large in noisy designs
+  # data loss
+  p_reject   = 0.45    # proportion of trials lost (about 27 of 50 kept; Heise et al., 2022)
+)
+
+set.seed(2026)
+```
+
+## Simulating the design with `faux`
+
+```{r faux-sim}
+sim_faux <- function(p) {
+  d <- add_random(subj_id = p$n_subj) %>%
+    add_random(actor_id = p$n_actor) %>%          # every child sees every actor
+    add_within(emotion = c("happy", "angry")) %>% # ...showing both emotions
+    add_random(rep = p$n_rep, .nested_in = c("subj_id", "actor_id", "emotion")) %>%
+    # random effects
+    add_ranef("subj_id", u0s = p$subj_int, u1s = p$subj_slope, .cors = p$subj_cor)
+  d <- if (p$actor_slope > 0) {
+    add_ranef(d, "actor_id", u0a = p$actor_int, u1a = p$actor_slope)
+  } else {
+    add_ranef(d, "actor_id", u0a = p$actor_int) %>% mutate(u1a = 0)
+  }
+  d %>%
+    add_ranef(e = p$sigma) %>%
+    # randomized presentation order within each child
+    group_by(subj_id) %>%
+    mutate(trial = sample(n())) %>%
+    # presentation number: the 1st, 2nd, ... 10th time this child saw this actor x emotion
+    group_by(subj_id, actor_id, emotion) %>%
+    mutate(PresentNum = rank(trial)) %>%
+    ungroup() %>%
+    mutate(
+      emotion_e = ifelse(emotion == "angry", 0.5, -0.5),  # effects coding
+      # centered on the middle presentation, so b0 and b_emotion are at an average presentation
+      PresentNum_gmc = PresentNum - mean(1:p$n_rep),
+      amp = (p$b0 + u0s + u0a) +
+            (p$b_emotion + u1s + u1a) * emotion_e +
+            p$b_present * PresentNum_gmc + e
+    ) %>%
+    # artifact rejection: drop a random subset of trials
+    filter(runif(n()) > p$p_reject)
+}
+
+dat <- sim_faux(params)
+head(dat)
+
+# trials kept per child per condition (unequal, as in real data)
+dat %>% count(subj_id, emotion) %>% summarise(mean = mean(n), min = min(n), max = max(n))
+```
+
+Let's plot the simulated data:
+
+```{r faux-plot}
+dat %>%
+  group_by(subj_id, emotion) %>%
+  summarise(amp = mean(amp), .groups = "drop") %>%
+  ggplot(aes(emotion, amp, group = subj_id)) +
+  geom_line(alpha = .3) +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", linewidth = 1.5, colour = "#D55E00") +
+  labs(x = NULL, y = "Mean Nc amplitude (µV)",
+       title = "One simulated sample: each line is a child") +
+  theme_minimal(base_size = 12)
+```
+
+Fit the planned model to check we recovered our simulated parameters:
+
+```{r faux-fit}
+m <- lmer(amp ~ emotion_e + PresentNum_gmc + (1 + emotion_e | subj_id) + (1 | actor_id),
+          data = dat)
+summary(m)$coefficients
+VarCorr(m)
+```
+
+## Power by simulation: participants × trials × rejection
+
+DeBruine & Barr (2021) wrap "simulate one dataset + fit the model + return the
+p-value" in a function and repeat it. 
+
+```{r single-run}
+sim_once <- function(p) {
+  d <- sim_faux(p)
+  m <- suppressMessages(
+    lmer(amp ~ emotion_e + PresentNum_gmc + (1 + emotion_e | subj_id) + (1 | actor_id), data = d)
+  )
+  coef(summary(m))["emotion_e", "Pr(>|t|)"]
+}
+
+power_for <- function(p, n_sims) {
+  pvals <- replicate(n_sims, sim_once(p))
+  mean(pvals < .05)
+}
+```
+
+```{r power-grid, cache=TRUE, fig.width=10, fig.height=4.8}
+# Use n_sims >= 1000 for a real analysis; 50 keeps the workshop fast.
+n_sims <- 50
+
+grid <- expand.grid(n_subj   = c(20, 30, 40, 60, 80),
+                    n_rep    = c(4, 10, 16),        # x 5 actors = 20, 50, or 80 trials/condition presented
+                    p_reject = c(0.1, 0.25, 0.45))  # 3 proportions of trials lost due to artifact/rejection
+
+# Run the simulations in parallel (one simulation per core at a time)
+cl <- parallel::makeCluster(max(1, parallel::detectCores() - 1))
+parallel::clusterEvalQ(cl, suppressMessages({library(tidyverse); library(faux); library(lme4); library(lmerTest)}))
+parallel::clusterExport(cl, c("params", "sim_faux", "sim_once"))
+parallel::clusterSetRNGStream(cl, 8675309)
+grid$power <- sapply(seq_len(nrow(grid)), function(i) {
+  p <- params
+  p$n_subj <- grid$n_subj[i]; p$n_rep <- grid$n_rep[i]; p$p_reject <- grid$p_reject[i]
+  pvals <- parallel::parSapply(cl, seq_len(n_sims), function(s, p) sim_once(p), p = p)
+  mean(pvals < .05)
+})
+parallel::stopCluster(cl)
+
+grid %>%
+  mutate(trials = factor(paste(n_rep * params$n_actor, "trials/condition presented"),
+                         levels = paste(c(4, 10, 16) * params$n_actor, "trials/condition presented")),
+         reject = paste0(p_reject * 100, "% of trials rejected")) %>%
+  ggplot(aes(n_subj, power, colour = trials)) +
+  geom_hline(yintercept = .8, linetype = "dashed", color = "grey40") +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  facet_wrap(~reject) +
+  scale_colour_viridis_d(option = "C", end = 0.85, direction = -1) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(x = "Number of participants", y = "Power (emotion effect)", colour = NULL,
+       title = "Participants, trials, and data loss all trade off") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+**What do you notice about the relation between power, trials, and participants?**
+
+
+## How many stimuli? Varying a different random factor
+
+*Adapted from Kumle, Võ & Draschkow's Scenario 2 notebook
+(<https://lkumle.github.io/power_notebooks/>), which varies the number of
+sentences in an eye-tracking study.*
+
+Power analyses usually ask "how many participants?" But in a crossed design,
+**stimuli are a random factor too**, and the number of stimuli can also limit power. 
+
+### Start from an existing, well-powered dataset
+
+One change from the simulations above: **actors now differ in their emotion effect**
+(`actor_slope = 1.5`). Some actors' angry and happy expressions are very
+different; others are subtle. Check `VarCorr()` below: does the model recover
+that 1.5 µV?
+
+```{r existing-data}
+existing_params <- params
+existing_params$n_subj      <- 40
+existing_params$n_actor     <- 12
+existing_params$actor_slope <- 1.5   # actors differ in how strong their emotion contrast is
+
+existing <- sim_faux(existing_params) %>%
+  mutate(subj_id = as.numeric(factor(subj_id)),
+         actor_id = as.numeric(factor(actor_id)))
+
+existing_model <- lmer(amp ~ emotion_e + PresentNum_gmc +
+                         (1 + emotion_e | subj_id) + (1 + emotion_e | actor_id),
+                       data = existing)
+fixef(existing_model)
+VarCorr(existing_model)
+```
+
+### Vary the number of actors
+
+Now `simvar` is the stimulus factor (instead of participants) and we fix the sample size at 40. 
+
+```{r mixedpower-actors, results = "hide"}
+pw_actors <- mixedpower(
+  model          = existing_model,
+  data           = existing,
+  fixed_effects  = c("emotion_e", "PresentNum_gmc"),
+  simvar         = "actor_id",
+  steps          = c(4, 8, 12, 16, 20, 24),
+  critical_value = 2,
+  n_sim          = 50,                         # 1,000+ for a real analysis
+  SESOI          = c(fixef(existing_model)[1], -1.5, fixef(existing_model)[3]),
+  databased      = TRUE
+)
+```
+
+```{r mixedpower-actors-results}
+pw_actors
+
+step_cols <- setdiff(names(pw_actors), c("mode", "effect"))
+pa_long <- do.call(rbind, lapply(step_cols, function(s)
+  data.frame(n_actor = as.numeric(s), power = pw_actors[[s]],
+             mode = pw_actors$mode, effect = pw_actors$effect)))
+
+ggplot(pa_long, aes(n_actor, power, colour = mode)) +
+  geom_hline(yintercept = .8, linetype = "dashed", color = "grey40") +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  facet_wrap(~effect) +
+  scale_colour_manual(values = c("#3D6080", "#D55E00")) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(x = "Number of actors (stimuli)", y = "Power", colour = NULL,
+       title = "How many stimuli? (40 children)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+**What to notice**
+
+- **Adding additional items in your stimulus category also adds more trials.** Each added actor adds 20 trials per
+  child (2 emotions × 10 presentations), so much of the power gain here comes
+  from extra trials, not from extra stimuli per-se. To separate the two, you could run a simulation where you hold the total number of trials constant.
+- **Look at the actor emotion slope in `VarCorr()`.** We simulated an SD of
+  1.5 µV, but with only 12 actors the model usually can't estimate it: it comes
+  out near 0, often with a correlation of ±1 (a singular fit). Stimulus variance needs many stimuli to estimate. 
+- `mixedpower` can only vary **random factors** (participants, stimuli). To
+  vary trials per condition or rejection rates, you have to use custom simulation scripts. 
+
+### Vary both: `R2power()`
+
+`R2power()` varies one random factor while holding a second at a new level,
+e.g. "how many children do I need if I use 16 actors instead of 12?"
+
+```{r r2power, results = "hide"}
+pw_both <- R2power(
+  model          = existing_model,
+  data           = existing,
+  fixed_effects  = c("emotion_e", "PresentNum_gmc"),
+  simvar         = "subj_id",
+  steps          = c(20, 30, 40, 60),
+  R2var          = "actor_id",
+  R2level        = 16,
+  critical_value = 2,
+  n_sim          = 50,
+  SESOI          = FALSE,
+  databased      = TRUE
+)
+```
+
+```{r r2power-results}
+pw_both
+```
+
+# Which tool when?
+
+| You want to... | Use |
+|---|---|
+| A quick answer for one two-level fixed effect, participants × stimuli | The Westfall et al. (2014) app |
+| Find how many participants you need, starting from pilot or open data | `mixedpower(simvar = "SubjectNum")` (Design 1) |
+| See how individual differences in the effect (random slopes) change power | Simulate with and without the slope (Design 1) |
+| Find how many participants to recruit under realistic missing data conditions | Your own simulation loop (Design 1, "Accounting for data loss") |
+| Vary trials per condition and artifact rejection | Your own simulation loop (Design 2) |
+| Find how many stimuli you need, starting from an existing dataset | `mixedpower(simvar = "actor_id")` (Design 2) |
+| Vary participants *and* number of stimuli | `R2power()` (Design 2) |
+
+# Adapting this to your own study
+
+1. **Effects:** replace the condition means with your best estimates from
+   pilot data, a closely related published study, or a paper that reports
+   its simulation parameters. Then set a SESOI (15%) smaller than that estimate.
+2. **Variance components:** replace `subject_sd`, `actor_sd`,
+   `trial_noise_sd` (and any random-slope SDs) with estimates from
+   comparable data. These matter as much as the mean difference.
+3. **Model:** fit the model you plan to run, with the
+   random-effects structure you'd likely settle on after Step 7. More complex
+   random-effects structures generally mean lower power (Matuschek et al.,
+   2017).
+4. **Design:** besides participants, consider varying trials or stimuli.
+   For ERP designs, trials per participant can be easier to increase than
+   sample size. `R2power()` varies a second random variable (e.g., number
+   of actors) at a fixed number of participants.
+5. **Simulations:** use `n_sim = 1000` for your final sample size estimate/preregistration.
+6. **Explore:** rerun the simulation across a range of plausible values to see how sensitive power is to your assumptions.
+
+Other tools: `simr` (Green & MacLeod, 2016) is slower but more flexible
+(it can build a model from scratch with `makeLmer()` and gives confidence
+intervals for power). For simulating LME data from scratch, see
+DeBruine & Barr (2021) and
+<https://debruine.github.io/lmem_sim/articles/appendix1a_example_code.html>.
+
+# Reporting your power analysis
+
+Report:
+
+- the planned model (formula)
+- where parameters came from (pilot, published study, or assumption)
+- the effect size powered for
+- the assumed trial counts and rejection rate
+- α and the significance criterion
+- number of simulations
+- the resulting N
+
+# About these materials
+
+These materials were developed for the Society for Psychophysiological
+Research pre-conference workshop "Linear mixed effects models for
+event-related potential research" (October 14, 2026, Halifax, Canada) by
+Megan J. Heise.
+
+Heise, M. J. (2026, October 14). *Linear mixed effects
+models for event-related potential research* [Workshop materials]. Society
+for Psychophysiological Research Annual Meeting, Halifax, Nova Scotia, Canada.
+
+# References
+
+- DeBruine, L. M., & Barr, D. J. (2021). Understanding mixed-effects models through
+  data simulation. *Advances in Methods and Practices in Psychological Science, 4*(1).
+  Code and appendices: <https://debruine.github.io/lmem_sim/>
+- DeBruine, L. (2023). *faux: Simulation for factorial designs.* <https://scienceverse.github.io/faux/>
+- Kumle, L., Võ, M. L.-H., & Draschkow, D. (2021). Estimating power in (generalized)
+  linear mixed models: An open introduction and tutorial in R.
+  *Behavior Research Methods, 53*, 2528–2543. <https://github.com/DejanDraschkow/mixedpower>
+- Kumle, Võ & Draschkow's power notebooks: worked `mixedpower` examples for
+  several scenarios (a well-powered starting design, varying stimuli, strong a
+  priori assumptions, a nested GLMM). <https://lkumle.github.io/power_notebooks/>
+- Heise, M. J., Mon, S. K., & Bowman, L. C. (2022). Utility of linear mixed effects
+  models for event-related potential research with infants and children.
+  *Developmental Cognitive Neuroscience, 54*, 101070.
+- Kumle, L., Võ, M. L.-H., & Draschkow, D. (2018). mixedpower: A library for
+  estimating simulation-based power for mixed models in R.
+  <https://doi.org/10.5281/zenodo.1341047>
+- Green, P., & MacLeod, C. J. (2016). SIMR: An R package for power analysis
+  of generalized linear mixed models by simulation. *Methods in Ecology and
+  Evolution, 7*(4), 493–498.
+- Westfall, J., Kenny, D. A., & Judd, C. M. (2014). Statistical power and
+  optimal design in experiments in which samples of participants respond to
+  samples of stimuli. *Journal of Experimental Psychology: General, 143*(5),
+  2020–2045.
+- Brysbaert, M. (2019). How many participants do we have to include in
+  properly powered experiments? A tutorial of power analysis with reference
+  tables. *Journal of Cognition, 2*(1), 16.
+- Hoenig, J. M., & Heisey, D. M. (2001). The abuse of power: The pervasive
+  fallacy of power calculations for data analysis. *The American
+  Statistician, 55*(1), 19–24.
+- Basma, B., Savage, R., & Bertone, A. (2024). The N400 in readers with
+  dyslexia: A systematic review and meta-analysis. *International Journal of
+  Psychophysiology, 196*, 112283.
+- DeBolt, M. C., Rhemtulla, M., & Oakes, L. M. (2020). Robust data and power
+  in infant research: A case study of the effect of number of infants and
+  number of trials in visual preference procedures. *Infancy, 25*(4), 393–419.
+- Kappenman, E. S., Farrens, J. L., Zhang, W., Stewart, A. X., & Luck, S. J.
+  (2021). ERP CORE: An open resource for human event-related potential
+  research. *NeuroImage, 225*, 117465. Materials: <https://erpinfo.org/erp-core>
+
+```{r session}
+sessionInfo()
+```

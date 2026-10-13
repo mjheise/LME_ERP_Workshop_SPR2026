@@ -1,0 +1,1531 @@
+---
+title: "Code-Along: Fitting LMEs to ERP Data (Face-Emotion, Nc)"
+subtitle: "Type along with the workshop: the 9 steps to building an LME, interpretation, and common errors"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+options(width = 120)  # wide enough that VarCorr() and summary() tables don't wrap
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                       fig.width = 7, fig.height = 5)
+
+# Packages -----------------------------------------------------------------
+# install packages needed for today: install.packages(c("lme4", "lmerTest", "performance", "see", "emmeans", "ggplot2", "tidyverse", "faux", "mixedpower"))
+
+library(tidyverse)    # data wrangling & plotting
+library(lme4)         # fit LME models
+library(lmerTest)     # Satterthwaite p-values for LME models
+library(sjPlot)       # formatted LME output
+library(broom.mixed)  # tidy() for LMEs
+library(emmeans)      # estimated marginal means
+library(performance)  # check_convergence, check_singularity, icc
+library(kableExtra)   # formatted tables
+```
+
+# Overview
+
+In this tutorial, we will:
+
+1. Simulate a small ERP dataset with a hierarchical study design
+   (trials nested in stimuli/conditions, nested in participants).
+2. Walk through the 9 steps to building an LME: from the maximal model,
+   simplified until it converges, through checking assumptions and
+   visualizing the results.
+3. Interpret the final model's fixed and random effects, and see how
+   centering and coding (dummy vs. effects) change what the coefficients mean.
+4. Illustrate common issues with LMEs (non-convergence,
+   mis-specified random effects, REML vs. ML comparisons) so you recognize
+   these errors and know how to fix them in your own data.
+5. Go through some more examples of centering predictors (grand-mean centering vs.           centering within cluster).
+
+## How to use this code-along
+
+- **"Your turn" chunks** have the code you'll type, with blanks (`___`) to
+  fill in. The code is commented out (`#`) so the file always runs: fill in the
+  blanks, delete the `#` at the start of each line, and run the chunk.
+- **"Catch up" chunks** come right after each "Your turn". They have the full
+  code for that step. **Run each one either way:** if your code worked, it just
+  recreates the same objects (plus anything the next steps need); if you got
+  stuck, fell behind, or got an error, it fills in the step for you.
+- **Lost completely?** Click on the next chunk and use **Run All Chunks Above**
+  (the ▼ button at the top right of the chunk, or Ctrl+Alt+P / Cmd+Option+P).
+  That runs everything before it, including the catch-up chunks, so you can
+  pick up at any step.
+
+---
+
+# Simulating an ERP Study
+
+## Study design
+
+Children aged 3–5 years view faces expressing two emotions ("happy" and "angry"), 
+each expression displayed by several different actors, with each actor/emotion 
+combination repeated across 10 trials (a fully-crossed design where every 
+participant sees every actor express every emotion the same number of times).
+Each child's age (in years) is a participant-level variable: one value per child.
+
+```{r design-params}
+# Study design parameters --------------------------------------------------
+n_subjects       <- 40      # number of participants
+n_actors         <- 5       # number of actors per emotion condition
+n_presentations  <- 10      # number of times each actor/emotion is shown
+emotion_labels   <- c("Happy", "Angry")
+
+# Population-level parameters 
+mean_amp_happy   <- -10     # population NC mean amplitude for Happy (microvolts)
+mean_amp_angry   <- -12     # population NC mean amplitude for Angry (microvolts)
+decay_per_trial  <- 0.5     # amplitude becomes *less* negative by this much per presentation (habituation)
+age_effect       <- -2      # amplitude becomes *more* negative by this much per year of age, averaged over
+                            # emotions (older children have larger NCs)
+emotion_age_int  <- 1.5     # the Happy - Angry difference grows by this much per year of age
+                            # (0.5 µV at age 3, 2 µV at age 4, 3.5 µV at age 5)
+subject_sd       <- 10      # SD of random intercepts across participants
+actor_sd         <- 5       # SD of random intercepts across actors
+trial_noise_sd   <- 8       # single-trial (residual) noise SD
+
+set.seed(425)
+```
+
+
+## Building the trial-level dataset
+
+We simulate one row per trial. We simulate random intercepts for each participant
+and each actor (stimulus feature). In addition, we simulate additional trial-level
+noise.
+
+```{r simulate-data}
+subject_ids <- sprintf("%02d", 1:n_subjects)
+actor_ids   <- sprintf("%02d", 1:n_actors)
+
+# Random effects: one random intercept per participant, one per actor
+# Each participant also gets one age (years), drawn uniformly between 3 and 5
+subject_re <- tibble(SubjectID = subject_ids,
+                      subj_intercept = rnorm(n_subjects, mean = 0, sd = subject_sd),
+                      AgeYears = round(runif(n_subjects, min = 3, max = 5), 1))
+
+actor_re <- tibble(ActorID = actor_ids,
+                    actor_intercept = rnorm(n_actors, mean = 0, sd = actor_sd))
+
+# Full trial-level grid: every participant x every actor x every emotion x every presentation
+sim_data <- expand_grid(
+  SubjectID  = subject_ids,
+  Emotion    = emotion_labels,
+  ActorID    = actor_ids,
+  PresentNum = 1:n_presentations
+) %>%
+  left_join(subject_re, by = "SubjectID") %>%
+  left_join(actor_re, by = "ActorID") %>%
+  mutate(
+    emotion_effect = case_when(Emotion == "Happy" ~ mean_amp_happy, 
+                               Emotion == "Angry" ~ mean_amp_angry),
+    # amplitude habituates (becomes less negative) across repeated presentations;
+    # centered on the middle presentation so the emotion_effect above stays
+    # interpretable as the mean amplitude at an "average" presentation number
+    decay_effect = decay_per_trial * (PresentNum - mean(1:n_presentations)),
+    # older children have larger (more negative) amplitudes; centered on age 4
+    age_shift = age_effect * (AgeYears - 4),
+    # Emotion x Age interaction: the Happy - Angry difference grows with age
+    # (half of the interaction added to Happy, half subtracted from Angry, so the
+    # age effect averaged over emotions is still age_effect)
+    emotion_age_shift = if_else(Emotion == "Happy", 0.5, -0.5) * emotion_age_int * (AgeYears - 4),
+    trial_noise = rnorm(n(), mean = 0, sd = trial_noise_sd),
+    MeanAmp = emotion_effect + decay_effect + age_shift + emotion_age_shift +
+      subj_intercept + actor_intercept + trial_noise
+  )
+
+glimpse(sim_data)
+
+# Remove columns used in data simulation
+sim_data <- sim_data %>%
+  select(SubjectID, Emotion, ActorID, PresentNum, AgeYears, MeanAmp)
+
+```
+
+---
+
+# Descriptive Statistics & Data Visualization
+
+Before hypothesis testing by fitting a model, we will look at our data to inform
+our model (e.g., data distribution, outliers, linearity).
+
+```{r data-plotting}
+# Distribution of mean amplitude
+ggplot(data = sim_data, aes(x = MeanAmp)) +
+  geom_histogram() +
+  theme_minimal() +
+  labs(x = "Mean amplitude (µV)", y = "Count", 
+       title = "Histogram of mean amplitude")
+
+# Distribution of mean amplitude (by actor)
+ggplot(data = sim_data, aes(x = MeanAmp)) +
+  geom_histogram() +
+  theme_minimal() +
+  labs(x = "Mean amplitude (µV)", y = "Count", 
+       title = "Histogram of mean amplitude by Actor (stimulus feature)") +
+  facet_wrap(~ActorID) # +facet_wrap(~ActorID+Emotion)
+
+# Summary statistics by actor/stimulus feature
+sim_data %>%
+  group_by(ActorID) %>%
+  summarize(mean = mean(MeanAmp),
+            sd = sd(MeanAmp),
+            median = median(MeanAmp),
+            min = min(MeanAmp),
+            max = max(MeanAmp))
+
+# Distribution of mean amplitude (by emotion)
+ggplot(data = sim_data, aes(x = MeanAmp)) +
+  geom_histogram() +
+  theme_minimal() +
+  labs(x = "Mean amplitude (µV)", y = "Count", 
+       title = "Histogram of mean amplitude by emotion (condition)") +
+  facet_wrap(~Emotion)
+
+# Linearity of predictors
+ggplot(data = sim_data, aes(x = PresentNum, y = MeanAmp)) + 
+  geom_jitter() + 
+  geom_smooth(formula = y ~ x, method = "lm") + 
+  theme_minimal() + 
+  scale_x_continuous(breaks = seq(0, 10, by = 1)) + 
+  labs(x = "Presentation Number", y = "Mean amplitude (µV)",
+       title = "Checking linearity between presentation number and mean amplitude") # + facet_wrap(~Emotion+Actor)
+
+# Linearity of age (a participant-level predictor: plot one mean per child)
+sim_data %>%
+  group_by(SubjectID, AgeYears) %>%
+  summarize(MeanAmp = mean(MeanAmp), .groups = "drop") %>%
+  ggplot(aes(x = AgeYears, y = MeanAmp)) +
+  geom_point() +
+  geom_smooth(formula = y ~ x, method = "lm") +
+  theme_minimal() +
+  labs(x = "Age (years)", y = "Child's mean amplitude (µV)",
+       title = "Checking linearity between age and mean amplitude")
+
+
+```
+
+
+---
+
+# Fitting an LME
+
+We'll follow 9 steps to building an LME:
+
+## Step 1: Define the research question(s)
+
+1. Is there a difference in NC mean amplitude elicited by Happy vs. Angry faces?
+2. Does the magnitude of the NC emotion difference change with age (3 to 5 years)?
+
+## Step 2: List all relevant variables
+
+- 
+- 
+- 
+- 
+- 
+
+## Step 3: Draw the study design schematic
+
+```{r design-diagram, fig.height=5.5}
+subj_nodes  <- tibble(label = c("Subject 01", "Subject 02", "Subject 03", "…",
+                                paste("Subject", n_subjects)),
+                      x = 1:5, y = 2)
+actor_nodes <- tibble(label = paste("Actor", sprintf("%02d", 1:n_actors)),
+                      x = seq(1, 5, length.out = n_actors), y = 1)
+emotion_nodes <- expand_grid(actor_x = actor_nodes$x,
+                             Emotion = emotion_labels) %>%
+  mutate(x = actor_x + if_else(Emotion == "Happy", -0.22, 0.22), y = 0)
+edges <- expand_grid(x = subj_nodes$x[subj_nodes$label != "…"],
+                     xend = actor_nodes$x)
+
+ggplot() +
+  geom_segment(data = edges, aes(x = x, xend = xend, y = 2, yend = 1),
+               colour = "grey75") +
+  geom_segment(data = emotion_nodes, aes(x = actor_x, xend = x, y = 1, yend = 0),
+               colour = "grey45") +
+  geom_label(data = filter(subj_nodes, label != "…"), aes(x, y, label = label),
+             fill = "#9CAF88", colour = "white", fontface = "bold") +
+  geom_text(data = filter(subj_nodes, label == "…"), aes(x, y, label = label),
+            size = 6) +
+  geom_label(data = actor_nodes, aes(x, y, label = label),
+             fill = "#3D6080", colour = "white", fontface = "bold") +
+  geom_label(data = emotion_nodes, aes(x, y, label = Emotion, fill = Emotion),
+             colour = "white", fontface = "bold", size = 3) +
+  scale_fill_manual(values = c(Happy = "#D4A24C", Angry = "#B5573B"),
+                    guide = "none") +
+  annotate("label", x = 3, y = 1.5, fill = "white", size = 3.5,
+           label = "every subject sees every actor") +
+  annotate("text", x = 3, y = -0.35, size = 3.5, fontface = "italic",
+           label = paste0("each emotion box = ", n_presentations,
+                          " presentations per subject  →  ", n_subjects, " × ",
+                          n_actors, " × 2 × ", n_presentations, " = ",
+                          n_subjects * n_actors * 2 * n_presentations,
+                          " trials")) +
+  labs(title = "Subjects and actors are fully crossed") +
+  scale_x_continuous(expand = expansion(add = 0.5)) +
+  scale_y_continuous(expand = expansion(add = 0.3)) +
+  theme_void(base_size = 12)
+```
+
+
+## Step 4: Categorize variables by type (categorical, numeric) & level (trial vs. subject)
+
+- 
+- 
+- 
+- 
+- 
+
+## Step 5: Assign fixed and random effects
+
+### Fixed effects
+
+- 
+- 
+- 
+- 
+
+### Random effects syntax
+- Random intercept only: `(1 | grouping)`, e.g., `(1 | SubjectID)` gives each participant their own baseline mean amplitude
+- Random intercept + random slope: `(predictor | grouping)` or `(1 + predictor | grouping)`, e.g., `(1 + Emotion | SubjectID)` gives each participant their own baseline *and* their own emotion effect
+  - The predictor (left of `|`) must vary *within* each level of the grouping factor (right of `|`)
+- Uncorrelated intercept + slope: `(1 + predictor || grouping)`, which estimates the same variances but fixes the intercept–slope correlation at 0 (only works as intended with numeric predictors, it's uncommon to use this unless there's good theoretical evidence)
+
+### Possible random effects in our design
+
+*SubjectID*
+
+- `(1 | SubjectID)`: Do some participants have higher or lower mean amplitudes on average?
+- `(1 + Emotion | SubjectID)`: Does the effect of emotion (Happy vs. Angry) differ across participants?
+- `(1 + PresentNum | SubjectID)`: Does habituation (change in amplitude across presentations) differ across participants?
+- `(1 + Emotion * PresentNum | SubjectID)`: Does the change in the emotion effect across presentations differ across participants?
+- **No** `(1 + Age | SubjectID)`: each child has only one age, so age doesn't vary *within* a participant and an age slope by participant can't be estimated. Age is a fixed effect (a measured characteristic of each child), not a random effect.
+
+*ActorID*
+
+- 
+- 
+- 
+
+
+*SubjectID × ActorID (optional)*
+
+- 
+
+**What random slopes would you prioritize keeping in the model as you simplify?** 
+
+- 
+- 
+
+
+## Step 6: Consider data transformations & center predictors
+
+*Data transformations (e.g., nonlinear effects):* There wasn't evidence for
+nonlinear effects in our exploratory data visualization, so we would fit a linear effect of presentation number. 
+
+*Centering presentation number:*
+- Without an interaction (e.g., MeanAmp ~ Emotion + PresentNum + (1|SubjectID)), centering only effects the intercept.
+- With an interaction (e.g., MeanAmp ~ Emotion*PresentNum + (1|SubjectID)), uncentered presentation number will give predicted amplitude for the reference emotion at trial 0 (a trial that doesn't exist in our numbering scheme, but you could re-number the trial numbers to create a real trial) at 0.
+- Centering presentation number will give predicted amplitude for the reference emotion at the average trial.
+
+*Centering age:* 
+- Age is a participant-level predictor, so we could consider **grand-mean centering** (`Age_gmc` = age minus the sample's mean age). The intercept is then the predicted amplitude for a child of average age, instead of a child age 0.
+
+*Naming conventions:* we label each centered variable by how it was centered: `_gmc` for grand-mean centered (e.g., `Age_gmc`, `PresentNum_gmc`) and `_cwc` for centered within cluster (e.g., `PresentNum_cwc`, later in the tutorial). 
+
+*Coding Emotion:* for now, we'll use R's default **dummy coding**: Angry = 0 and Happy = 1, so Angry is the **reference group**. We'll come back to effects coding after we've fit and interpreted the final model (see "Circling back: dummy vs. effects coding").
+
+**Your turn:** create the centered versions of presentation number and age.
+
+```{r center-predictors-yourturn}
+# sim_data <- sim_data %>%
+#   mutate(PresentNum_gmc   = PresentNum - ___,   # grand-mean centered: 0 = the average presentation
+#          PresentNum_True0 = PresentNum - ___)   # 0 = the first presentation
+#
+# # Grand-mean center age using one value per child
+# mean_age <- mean(distinct(sim_data, SubjectID, AgeYears)$___)
+# sim_data <- sim_data %>%
+#   mutate(Age_gmc = ___ - mean_age)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r center-predictors-catchup, class.source = "fold-hide"}
+sim_data <- sim_data %>%
+  mutate(PresentNum_gmc = PresentNum - mean(PresentNum),
+         PresentNum_True0 = (PresentNum - 1))
+
+# Grand-mean center age using one value per child (the mean of the children's ages)
+mean_age <- mean(distinct(sim_data, SubjectID, AgeYears)$AgeYears)
+sim_data <- sim_data %>%
+  mutate(Age_gmc = AgeYears - mean_age)
+
+sim_data %>%
+  select(SubjectID, Emotion, MeanAmp, PresentNum, PresentNum_gmc, PresentNum_True0,
+         AgeYears, Age_gmc)
+```
+
+
+## Step 7: Fit the maximal model and simplify until convergence is reached
+
+We'll start from our theoretically-driven maximal model and simplify it **one
+random effect at a time**, using a "leave-one-out" approach: remove one random
+effect, refit, and check the fit. If that doesn't fix the problem, put it back
+and remove the matching random effect for the other grouping factor instead.
+If neither version converges without a singular fit, remove both and move on
+to the next type of random effect. We work through them in this order:
+
+1. **Interaction slopes first (Step 7b):** they're the least plausible and the
+   hardest to estimate.
+2. **Then main-effect slopes (Step 7c):** presentation number (habituation)
+   before emotion, because emotion is the effect we care most about. Within
+   each pair, we try the ActorID slope first: with only `r n_actors` actors,
+   there's the least information to estimate how actors differ.
+3. **Until we reach random intercepts only (Step 7d),** or stop earlier as
+   soon as a model converges without a singular fit.
+
+At each step, we check:
+
+- **Estimation warnings:** Is the fit singular or non-converging
+  (`isSingular()`, `check_convergence()`)? This tells us *that* the model is
+  too complex, but not *which* term is the problem.
+- **Variance components:** In `VarCorr()` output, look for random-effect SDs
+  near zero and correlations near ±1.
+
+We'll use a helper function so each model prints the same diagnostics:
+
+```{r check-fit-helper}
+check_fit <- function(fit) {
+  cat("Singular fit:", isSingular(fit), "\n\n")
+  print(VarCorr(fit), comp = "Std.Dev.")  # random-effect SDs and correlations
+}
+```
+
+### Step 7a: Fit the maximal model
+
+**Your turn:** fill in the random slopes for participants and for actors (Step 5 lists the options).
+
+```{r maximal-model-yourturn}
+# fit_max <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+#                   (1 + ___ | SubjectID) +
+#                   (1 + ___ | ActorID),
+#                 data = sim_data)
+#
+# check_fit(fit_max)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r maximal-model-catchup, warning=TRUE, class.source = "fold-hide"}
+# Maximal model following Barr et al. (2013)
+fit_max <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+                  (1 + Emotion * PresentNum_True0 | SubjectID) +  # children differ in amplitude, emotion effect, habituation,
+                                                                  # and how the emotion effect changes over presentations
+                  (1 + Emotion * PresentNum_True0 | ActorID),     # actors differ in amplitude, emotion effect, habituation,
+                                                                  # and how the emotion effect changes over presentations
+                data = sim_data)
+
+check_fit(fit_max)
+```
+
+A singular fit means the model estimated a random-effect variance at zero or a
+correlation at ±1.
+
+What the variance components tell us:
+
+- **ActorID:** the slope SDs are close to zero, and several correlations are
+  near ±1.
+- **SubjectID:** the slopes are correlated with each other at about ±.99 or
+  higher, so some terms are redundant with each other.
+
+### Leave-one-out approach
+
+Here's every model we would fit along the way to reaching a model that converges and doesn't have a singular fit. Some of these are in code chunks below to illustrate what the output looks like. 
+
+**Round 1: interaction slopes** (starting from the maximal model, Step 7a)
+
+- Remove the by-actor interaction slope:
+  `(1 + Emotion * PresentNum_True0 | SubjectID) + (1 + Emotion + PresentNum_True0 | ActorID)`
+  → still singular (shown below as `fit_7b1`).
+- Put it back and remove the by-participant interaction slope instead:
+  `(1 + Emotion + PresentNum_True0 | SubjectID) + (1 + Emotion * PresentNum_True0 | ActorID)`
+  → still singular, and it also fails to converge (not shown).
+- Neither works, so remove both:
+  `(1 + Emotion + PresentNum_True0 | SubjectID) + (1 + Emotion + PresentNum_True0 | ActorID)`
+  → still singular (shown below as `fit_7b2`).
+
+**Round 2: presentation-number slopes** (habituation)
+
+- Remove the by-actor slope (do actors differ in how fast children habituate to them?):
+  `(1 + Emotion + PresentNum_True0 | SubjectID) + (1 + Emotion | ActorID)`
+  → still singular (shown below as `fit_7c1`).
+- Put it back and remove the by-participant slope (do children habituate at different rates?):
+  `(1 + Emotion | SubjectID) + (1 + Emotion + PresentNum_True0 | ActorID)`
+  → still singular (not shown).
+- Neither works, so remove both:
+  `(1 + Emotion | SubjectID) + (1 + Emotion | ActorID)`
+  → still singular (shown below as `fit_7c2`).
+
+**Round 3: emotion slopes** (the effect we care most about, so these go last)
+
+- Remove the by-actor slope (do actors pose emotions with different intensity?):
+  `(1 + Emotion | SubjectID) + (1 | ActorID)`
+  → still singular: the by-participant emotion slope is tiny, with a correlation of
+  −1 with the intercept (shown below as `fit_7c3`).
+- Put it back and remove the by-participant slope (do children differ in their emotion effect?):
+  `(1 | SubjectID) + (1 + Emotion | ActorID)`
+  → still singular: the by-actor emotion slope has a correlation of +1 with
+  the intercept (not shown).
+- Neither works, so remove both:
+  `(1 | SubjectID) + (1 | ActorID)`
+  → converges and isn't singular: this is our final random-effects structure
+  (Step 7d, `fit_int1`).
+
+### Step 7b: Remove the interaction slopes
+
+Round 1, first try: remove the ActorID interaction slope.
+
+**Your turn:** remove the by-actor interaction slope, keeping everything else.
+
+```{r model-7b1-yourturn}
+# fit_7b1 <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+#                   (1 + Emotion * PresentNum_True0 | SubjectID) +
+#                   (1 + ___ | ActorID),
+#                 data = sim_data)
+#
+# check_fit(fit_7b1)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r model-7b1-catchup, class.source = "fold-hide"}
+fit_7b1 <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+                  (1 + Emotion * PresentNum_True0 | SubjectID) +
+                  (1 + Emotion + PresentNum_True0 | ActorID),
+                data = sim_data)
+
+check_fit(fit_7b1)
+```
+
+Still singular. Removing only the SubjectID interaction slope instead is also
+singular (not shown), so we remove both:
+
+```{r model-7b2}
+fit_7b2 <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+                  (1 + Emotion + PresentNum_True0 | SubjectID) +
+                  (1 + Emotion + PresentNum_True0 | ActorID),
+                data = sim_data)
+
+check_fit(fit_7b2)
+```
+
+Still singular, so we move on to the main-effect slopes.
+
+### Step 7c: Remove the main-effect slopes
+
+Round 2, first try: remove the ActorID presentation-number slope (different
+habituation for different actors).
+
+```{r model-7c1}
+fit_7c1 <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+                  (1 + Emotion + PresentNum_True0 | SubjectID) +
+                  (1 + Emotion | ActorID),
+                data = sim_data)
+
+check_fit(fit_7c1)
+```
+
+Still singular. Removing only the SubjectID presentation-number slope instead
+is also singular (not shown), so we remove both presentation-number slopes:
+
+```{r model-7c2}
+fit_7c2 <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+                  (1 + Emotion | SubjectID) +
+                  (1 + Emotion | ActorID),
+                data = sim_data)
+
+check_fit(fit_7c2)
+```
+
+Still singular. Round 3, first try: remove the ActorID emotion slope
+(different actors express the emotions with different intensity).
+
+```{r model-7c3}
+fit_7c3 <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+                  (1 + Emotion | SubjectID) +
+                  (1 | ActorID),
+                data = sim_data)
+
+check_fit(fit_7c3)
+```
+
+Still singular: the by-participant emotion slope SD is only
+`r round(attr(VarCorr(fit_7c3)$SubjectID, "stddev")[["EmotionHappy"]], 2)` µV
+(next to an intercept SD of about 10 µV), and its correlation with the
+intercept is at ±1. Removing only the by-participant emotion slope instead is also
+singular (not shown), so we remove both emotion slopes.
+
+### Step 7d: Random intercepts only
+
+**Your turn:** fit the model with random intercepts only, and check that it converges.
+
+```{r model-random-intercept-yourturn}
+# fit_int1 <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+#                    (___ | SubjectID) + (___ | ActorID),
+#                  data = sim_data)
+#
+# check_fit(fit_int1)
+# performance::check_convergence(___)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r model-random-intercept-catchup, class.source = "fold-hide"}
+fit_int1 <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+                   (1 | SubjectID) + (1 | ActorID),
+                 data = sim_data)
+
+check_fit(fit_int1)
+performance::check_convergence(fit_int1)
+```
+
+This model converges and isn't singular, so this is our **final random-effects
+structure**. That matches our simulation: we only simulated random intercepts,
+so every slope's true SD is 0. Next we look at the fixed effects (Step 7e).
+
+### Step 7e: Looking more at our fixed effects interactions (optional)
+
+Once we've reached the maximal random effects structure that converges, we're going to look more at our fixed effects to demonstrate some possible decisions we may have made (e.g., about centering). We might also pre-register some model simplification steps about our fixed effects (e.g., if interactions don't significantly improve model fit, we will remove interactions to fit a more parisimonious model). Or we might compare competing models (e.g., we might fit two models that each have a different behavioral predictor that is correlated, e.g., including either income or education level attained, see example in Mon et al., 2024). 
+
+The two interactions in our model:
+
+- **Emotion × Age is research question 2, so we keep it** whatever the test
+  shows. If a hypothesized interaction isn't significant, report it as
+  non-significant (estimate, 95% CI, *p*). Dropping it because it wasn't
+  significant is a data-driven choice that makes the remaining *p*-values look
+  more certain than they are.
+- **Emotion × Presentation number is a covariate.** We might pre-register that if this interaction doesn't improve model fit (likelihood-ratio   test, *p* > .05), we will omit it for a simpler model.
+
+Nested models (models in which one is a simplified version of another) can be tested using the lme4::anova function. anova(fit_no_ep, fit_int1) runs a likelihood-ratio test (LRT): does the bigger model fit the data significantly better than the smaller one? It reports each model's AIC, BIC, log-likelihood and deviance, then a χ² test. The χ² is the difference in deviance, and its df is the number of extra parameters (here 1, for the interaction). A significant p means the extra term improves the fit. Because the models differ in their fixed effects, anova() automatically refits both with maximum likelihood (ML) instead of REML before comparing them (refit = TRUE, the default). To compare models that differ only in their random effects, add refit = FALSE to keep REML.
+
+
+**Your turn:** fit the model without the Emotion × Presentation number interaction, then compare the two models.
+
+```{r fixed-effects-lrt-yourturn}
+# fit_no_ep <- lmer(MeanAmp ~ Emotion * Age_gmc + ___ +
+#                     (1 | SubjectID) + (1 | ActorID),
+#                   data = sim_data)
+#
+# anova(___, ___)   # smaller model first
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r fixed-effects-lrt-catchup, class.source = "fold-hide"}
+# Without the Emotion x Presentation number interaction (same random effects)
+fit_no_ep <- lmer(MeanAmp ~ Emotion * Age_gmc + PresentNum_True0 +
+                    (1 | SubjectID) + (1 | ActorID),
+                  data = sim_data)
+anova(fit_no_ep, fit_int1)   # refits both with ML (REML = FALSE)
+```
+
+The Emotion × Presentation number interaction doesn't improve the fit
+(*p* = `r round(anova(fit_no_ep, fit_int1)$"Pr(>Chisq)"[2], 2)`), so following our rule, we will remove it.
+Emotion × Age stays in because it's one of our research questions.
+
+Here's our **final model**, fit with REML (the default):
+
+**Your turn:** fit the final model and look at the output.
+
+```{r final-model-yourturn}
+# fit_final <- lmer(MeanAmp ~ ___ * Age_gmc + PresentNum_True0 +
+#                     (1 | SubjectID) + (1 | ActorID),
+#                   data = sim_data)
+#
+# summary(___)
+# tab_model(___)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r final-model-catchup, class.source = "fold-hide"}
+fit_final <- lmer(MeanAmp ~ Emotion * Age_gmc + PresentNum_True0 +
+                    (1 | SubjectID) + (1 | ActorID),
+                  data = sim_data)
+
+summary(fit_final)
+tab_model(fit_final)
+```
+
+### Describing the simplification in your methods
+
+In a methods section, you might write: *"We began with the maximal
+random-effects structure (Barr et al., 2013), without by-actor slopes for age,
+which we had no theoretical reason to expect. We simplified it one term at a
+time until the model converged without a singular fit, removing interaction
+slopes first and then main-effect slopes, starting with the by-actor slopes and
+keeping the by-participant emotion slope until last (Bates et al., 2015;
+Matuschek et al., 2017). We then tested the emotion × presentation
+number interaction, which we had pre-specified as a covariate, with a
+likelihood-ratio test, and removed it because it did not improve model fit
+(χ²(1) = `r sprintf("%.2f", anova(fit_no_ep, fit_int1)$Chisq[2])`, *p* =
+`r sub("^0", "", sprintf("%.2f", anova(fit_no_ep, fit_int1)$"Pr(>Chisq)"[2]))`). The final
+model included random intercepts for participants and actors, and fixed
+effects of emotion, presentation number, age (grand-mean centered), and the
+emotion × age interaction."*
+
+## Step 8: Check model assumptions
+
+The assumptions of an LME are similar to those of linear regression
+(Heise et al., 2022, Section 2.2):
+
+1. **Linearity:** continuous predictors are linearly related to the outcome.
+2. **Normal distribution of residuals:** the residuals follow a normal
+   distribution and aren't skewed.
+3. **Homoscedasticity (homogeneity of variance):** the residuals have similar
+   spread across groups (e.g., emotion conditions) and across the range of
+   predicted values.
+
+Unlike linear regression, LME does **not** assume that data points are
+independent, because the random effects model the dependence among trials
+from the same participant or actor. LME does add one assumption of its own:
+the random effects (e.g., each participant's intercept) are also assumed to be
+normally distributed.
+
+We check all of these at once with `check_model()` from the performance
+package (Lüdecke et al., 2021), which draws one diagnostic plot per assumption.
+It needs the **see** package installed to draw the plots.
+
+**Your turn:** check the model assumptions with one function.
+
+```{r check-model-yourturn}
+# check_model(___)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r check-model-catchup, fig.width=10, fig.height=12, class.source = "fold-hide"}
+check_model(fit_final)
+```
+
+
+What our plots show:
+
+- **Influential observations:** the green contour lines labeled 0.8 mark the
+  Cook's distance cutoff, and every point is inside them. A few points sit
+  close to the lines at the top and bottom edges, but none is anywhere near
+  influential: the largest Cook's distance is
+  `r round(max(cooks.distance(fit_final)), 3)`, far below 0.8, and
+  `check_outliers(fit_final)` finds no outliers. All leverage values are tiny
+  and nearly identical (no single trial out of 4,000 carries much weight), and
+  they stack up into one narrow band because the design is balanced. The
+  labeled points are just the largest residuals; being labeled doesn't make
+  them a problem. In smaller plots (e.g., on a slide), the contour lines can
+  fall outside the plotted range, which also means every point is inside them.
+- **Collinearity:** all VIFs are close to 1, because age and presentation
+  number are centered and the design is balanced.
+- **Normality of random effects:** with only `r n_actors` actors, the actor
+  panel has only 5 points so hard to interpret this plot but we'll say it looks okay.
+
+**Why plots instead of tests?** With `r nrow(sim_data)` trials, formal tests
+(e.g., Shapiro-Wilk for normality or a test for heteroscedasticity) can be significant even when there are only small deviations from the assumption. Some researchers recommend Shapiro-Wilk for samples up to 5,000 but other researchers suggest that Shapiro-Wilk is too sensitive even lower (e.g., at 4,000 observations). Beyond 4,000-5,000 observations/total trials you should use visual inspection.
+
+### Reporting
+
+You might write: *"Model assumptions (linearity, homogeneity of variance,
+normality of the residuals and random effects, collinearity, and influential
+observations) were checked by visual inspection of diagnostic plots
+(`check_model()` in the performance package; Lüdecke et al., 2021)."*
+
+
+## Step 9: Interpret and visualize results
+
+### Interpreting the model output
+
+Let's start with the model output:
+```{r fit-final-interpretation}
+# There's the default R output from our model
+summary(fit_final)
+
+# Here's output from the sjPlot package
+tab_model(fit_final)
+
+```
+
+### Fixed effects
+
+`Emotion` is a character variable, so R uses alphabetical order and **Angry is
+the reference level**. `EmotionHappy` is therefore the Happy − Angry
+difference. Because our model includes an Emotion × Age interaction, the
+`Emotion` and `Age_gmc` coefficients are *simple effects*: each is the effect
+when the predictor it interacts with is 0. So the emotion effect is for a child
+of average age (`Age_gmc` = 0, i.e., `r round(mean_age, 1)` years), and the age
+effect is for **Angry** faces. Presentation number doesn't interact with
+anything, so its slope applies to both emotions.
+
+```{r fixef-true0}
+b_raw <- fixef(fit_final)
+```
+
+- **(Intercept) = `r round(b_raw["(Intercept)"], 2)` µV:** predicted mean amplitude for
+  **Angry** faces on the **first presentation** (`PresentNum_True0` = 0), for a
+  child of average age.
+- **EmotionHappy = `r round(b_raw["EmotionHappy"], 2)` µV:** Happy faces elicit a mean
+  amplitude `r round(b_raw["EmotionHappy"], 2)` µV more positive than Angry faces **for a
+  child of average age** (simulated: `r mean_amp_happy - mean_amp_angry` µV at age 4).
+- **PresentNum_True0 = `r round(b_raw["PresentNum_True0"], 2)` µV:** for both emotions, mean
+  amplitude becomes `r round(b_raw["PresentNum_True0"], 2)` µV more positive with each
+  additional presentation (habituation; simulated: `r decay_per_trial` µV).
+- **Age_gmc = `r round(b_raw["Age_gmc"], 2)` µV:** for **Angry** faces, the
+  predicted change in mean amplitude for each additional year of age
+  (simulated: `r age_effect - emotion_age_int / 2` µV per year for Angry faces;
+  p = `r round(summary(fit_final)$coefficients["Age_gmc", "Pr(>|t|)"], 3)`).
+  Look at its df (≈ `r round(summary(fit_final)$coefficients["Age_gmc", "df"])`)
+  and SE: age is a participant-level predictor, so it's tested against differences
+  *between children* (SD ≈ `r round(attr(VarCorr(fit_final)$SubjectID, "stddev"), 1)` µV)
+  with only `r n_subjects` children, not against the `r format(nrow(sim_data), big.mark = ",")`
+  trials. A 2-to-3 µV-per-year effect over a 2-year age range is small next to
+  that, so the estimate can land far from the simulated value. Participant-level
+  effects need enough *participants*; more trials don't help.
+- **EmotionHappy:Age_gmc = `r round(b_raw["EmotionHappy:Age_gmc"], 2)` µV:** how much
+  the age effect differs for Happy vs. Angry faces (Happy age effect =
+  `r round(b_raw["Age_gmc"] + b_raw["EmotionHappy:Age_gmc"], 2)` µV per year).
+  Equivalently, how much the Happy − Angry difference grows per year of age
+  (simulated: `r emotion_age_int` µV;
+  p `r ifelse(summary(fit_final)$coefficients["EmotionHappy:Age_gmc", "Pr(>|t|)"] < .001, "< .001", paste("=", round(summary(fit_final)$coefficients["EmotionHappy:Age_gmc", "Pr(>|t|)"], 3)))`).
+  Unlike `Age_gmc`, this is tested against trial-level variability (look at its
+  df), because the emotion effect is measured within each child.
+
+### Visualizing the results
+
+I prefer plotting the LME model's
+**estimated marginal means** (EMMs) for the fixed effects of interest, rather
+than raw averages because when we report our models we're reporting the model estimates (not the raw averages). EMMs are the model's predicted mean amplitude for each
+condition, averaged over (or set at the mean of) the other predictors, so they
+use every trial and account for the random effects. When it's possible, it's nice to show subject averages or trial-level variability so that readers get a sense of the means and spread of the data. We'll make three plots:
+
+1. EMMs across repeated presentations 
+2. EMMs for each emotion 
+3. EMMs across age, our participant-level predictor
+
+Error bars and ribbons show **±1 standard error (SE)** of each EMM. 
+
+```{r visualize-results}
+# Same colors for each emotion in every plot
+emotion_colors <- c(Angry = "#D55E00", Happy = "#0072B2")
+
+# 1. Model-estimated mean amplitude for each emotion across presentations
+emm_final <- emmeans(fit_final, ~ Emotion | PresentNum_True0,
+                     at = list(PresentNum_True0 = 0:(n_presentations - 1)),
+                     lmer.df = "asymptotic")   # > 3,000 trials: asymptotic df
+
+as.data.frame(emm_final) %>%
+  ggplot(aes(x = PresentNum_True0 + 1, y = emmean, color = Emotion, fill = Emotion)) +
+  geom_ribbon(aes(ymin = emmean - SE, ymax = emmean + SE), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(breaks = 1:n_presentations) +
+  scale_color_manual(values = emotion_colors) +
+  scale_fill_manual(values = emotion_colors) +
+  labs(x = "Presentation number", y = "Model-estimated mean amplitude (µV)",
+       title = "Model-estimated NC amplitude by emotion",
+       subtitle = "Ribbons = ±1 SE") +
+  theme_minimal()
+```
+
+**Estimated marginal means for each emotion.** These are at the average
+presentation number and the average age. The gray lines show each child's
+observed mean for context: the EMMs summarize the population, while the gray
+lines show how much children vary around it.
+
+**Your turn:** get the estimated marginal means for each emotion. (The catch-up chunk adds the plot.)
+
+```{r visualize-emmeans-emotion-yourturn}
+# emm_emotion <- emmeans(fit_final, ~ ___, lmer.df = "asymptotic")
+# emm_emotion
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r visualize-emmeans-emotion-catchup, class.source = "fold-hide"}
+# 2. EMMs for each emotion (at the average presentation number and age)
+emm_emotion <- emmeans(fit_final, ~ Emotion, lmer.df = "asymptotic")
+emm_emotion
+
+# Each child's observed mean for each emotion
+child_means <- sim_data %>%
+  group_by(SubjectID, Emotion) %>%
+  summarise(MeanAmp = mean(MeanAmp), .groups = "drop")
+
+as.data.frame(emm_emotion) %>%
+  ggplot(aes(x = Emotion, y = emmean, color = Emotion)) +
+  geom_line(data = child_means, aes(y = MeanAmp, group = SubjectID),
+            color = "grey80", linewidth = 0.4) +
+  geom_point(data = child_means, aes(y = MeanAmp), color = "grey65", size = 1.2) +
+  geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE), width = 0.12, linewidth = 1) +
+  geom_point(size = 4) +
+  scale_color_manual(values = emotion_colors) +
+  labs(x = NULL, y = "Mean amplitude (µV)",
+       title = "Model-estimated NC amplitude by emotion",
+       subtitle = "Colored points and error bars = EMMs ± 1 SE; gray = each child's observed mean") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Estimated marginal means across age.** Age is a participant-level predictor, so
+each point is one child's observed mean (one per emotion), and the lines are
+the model's estimates across the age range.
+
+```{r visualize-emmeans-age}
+# 3. EMMs across the observed age range (at the average presentation number)
+age_grid <- seq(min(sim_data$Age_gmc), max(sim_data$Age_gmc), length.out = 25)
+emm_age <- emmeans(fit_final, ~ Emotion | Age_gmc, at = list(Age_gmc = age_grid),
+                   lmer.df = "asymptotic")
+
+child_age_means <- sim_data %>%
+  group_by(SubjectID, AgeYears, Emotion) %>%
+  summarise(MeanAmp = mean(MeanAmp), .groups = "drop")
+
+as.data.frame(emm_age) %>%
+  mutate(AgeYears = Age_gmc + mean_age) %>%            # back to years for the x-axis
+  ggplot(aes(x = AgeYears, y = emmean, color = Emotion, fill = Emotion)) +
+  geom_point(data = child_age_means, aes(y = MeanAmp), alpha = 0.5, size = 1.5) +
+  geom_ribbon(aes(ymin = emmean - SE, ymax = emmean + SE), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = emotion_colors) +
+  scale_fill_manual(values = emotion_colors) +
+  labs(x = "Age (years)", y = "Mean amplitude (µV)",
+       title = "Model-estimated NC amplitude across age",
+       subtitle = "Lines and ribbons = EMMs ± 1 SE; points = each child's observed mean") +
+  theme_minimal()
+```
+
+The lines aren't parallel: the Happy − Angry difference is small in the
+youngest children and grows with age. That's the Emotion × Age interaction. The
+age ribbons are wide because age is tested against only 40 children (df = 38),
+not ~4,000 trials.
+
+**Two more figures for a paper:**
+
+- **The grand-average waveform**, averaged across all children (with no
+  casewise deletion), so readers can compare with earlier ERP studies. Our
+  simulation only has mean amplitudes, so we can't plot it here.
+- **Single-trial waveforms from an example participant**, to show variability in single-trial data (can also go in Supplement for publications).
+
+---
+
+# Going further with the final model
+
+## Circling back: dummy vs. effects coding
+
+In Step 6, we said we'd come back to how Emotion is coded. Now that we have a
+final model, we can see what changes when we code it differently.
+
+So far, `Emotion` has used R's default **dummy (treatment) coding**: Angry = 0,
+Happy = 1. With dummy coding, every effect that interacts with emotion is that
+effect **in the reference group**. Our model has an Emotion × Age interaction,
+so the `Age_gmc` coefficient above is the age effect *for Angry faces only*.
+
+If we want those effects **averaged across both emotions** (what most people
+mean by a "main effect"), we can use **effects coding** instead. There are two
+common versions:
+
+- **±0.5:** Angry = −0.5, Happy = +0.5 (the two levels are 1 unit apart)
+- **±1:** Angry = −1, Happy = +1 (the two levels are 2 units apart)
+
+Here's our final model fit all three ways. Presentation number and age are
+the same as before (0 = the first presentation; age centered), so coding is the
+only difference.
+
+**Your turn:** make the effects-coded emotion variable and refit the final model with it.
+
+```{r effects-coding-yourturn}
+# sim_data <- sim_data %>%
+#   mutate(Emotion_e = ifelse(Emotion == "Happy", ___, ___))   # Angry = -0.5, Happy = +0.5
+#
+# fit_final_effects <- lmer(MeanAmp ~ ___ * Age_gmc + PresentNum_True0 +
+#                             (1 | SubjectID) + (1 | ActorID),
+#                           data = sim_data)
+#
+# summary(fit_final_effects)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r effects-coding-catchup, class.source = "fold-hide"}
+# Effects coding: Angry = -0.5, Happy = +0.5
+# Effects coding: Angry = -1,   Happy = +1
+sim_data <- sim_data %>%
+  mutate(Emotion_e  = ifelse(Emotion == "Happy", 0.5, -0.5),
+         Emotion_e1 = ifelse(Emotion == "Happy", 1, -1))
+
+# Dummy coding (Angry = 0, Happy = 1) is our final model, fit_final
+
+fit_final_effects <- lmer(MeanAmp ~ Emotion_e * Age_gmc + PresentNum_True0 +
+                            (1 | SubjectID) + (1 | ActorID),
+                          data = sim_data)
+
+fit_final_effects1 <- lmer(MeanAmp ~ Emotion_e1 * Age_gmc + PresentNum_True0 +
+                             (1 | SubjectID) + (1 | ActorID),
+                           data = sim_data)
+
+# Same model, just reparameterized: the predictions are identical
+all.equal(fitted(fit_final), fitted(fit_final_effects))
+all.equal(fitted(fit_final), fitted(fit_final_effects1))
+```
+
+**Another way: `contrasts()`.** Instead of making a new numeric variable, you
+can keep `Emotion` as a factor and change how R codes it:
+
+```{r effects-coding-contrasts, eval = FALSE}
+sim_data_c <- sim_data %>%
+  mutate(Emotion = factor(Emotion, levels = c("Angry", "Happy")))
+contrasts(sim_data_c$Emotion) <- c(-0.5, 0.5)   # Angry = -0.5, Happy = +0.5
+
+lmer(MeanAmp ~ Emotion * Age_gmc + PresentNum_True0 +
+       (1 | SubjectID) + (1 | ActorID),
+     data = sim_data_c)
+```
+
+This gives the same estimates as `fit_final_effects`; only the coefficient's
+name changes (`Emotion1` instead of `Emotion_e`). Keeping a factor is handy for
+predictors with 3+ levels, and `emmeans()` and plotting functions keep the
+level names (Angry, Happy). Two cautions:
+
+- R's built-in `contr.sum()` codes the **first** level as +1. With Angry
+  first, that makes Angry = +1 and Happy = −1, so the Emotion coefficient flips
+  sign (and is half the Happy − Angry difference). Setting the values yourself,
+  as above, avoids this.
+- The `||` shortcut for uncorrelated random effects only works with numeric
+  predictors. If you need `(1 + Emotion_e || SubjectID)`, use the numeric
+  version.
+
+### The output for each model
+
+```{r effects-coding-output}
+# # Dummy coding: Angry = 0, Happy = 1
+# summary(fit_final)
+# 
+# # Effects coding: Angry = -0.5, Happy = +0.5
+# summary(fit_final_effects)
+# 
+# # Effects coding: Angry = -1, Happy = +1
+# summary(fit_final_effects1)
+
+# Side-by-side with sjPlot
+tab_model(fit_final, fit_final_effects, fit_final_effects1,
+          dv.labels = c("Dummy (Angry = 0, Happy = 1)",
+                        "Effects (Angry = -0.5, Happy = +0.5)",
+                        "Effects (Angry = -1, Happy = +1)"))
+```
+
+### All coefficients side by side
+
+The three models name the emotion terms differently (`EmotionHappy`,
+`Emotion_e`, `Emotion_e1`), so we line them up by what each term is:
+
+```{r effects-coding-table}
+# Pull the fixed effects from one model and label each term by its role
+coef_by_role <- function(fit, emo, coding) {
+  tidy(fit, effects = "fixed") %>%
+    mutate(Term = case_when(
+             term == "(Intercept)"                         ~ "Intercept",
+             term == emo                                   ~ "Emotion",
+             term == "PresentNum_True0"                 ~ "Presentation number",
+             term == "Age_gmc"                               ~ "Age",
+             term == paste0(emo, ":PresentNum_True0")   ~ "Emotion × Presentation number",
+             term == paste0(emo, ":Age_gmc")                 ~ "Emotion × Age"),
+           Coding = coding)
+}
+
+term_order <- c("Intercept", "Emotion", "Presentation number", "Age",
+                "Emotion × Presentation number", "Emotion × Age")
+
+# Line up the three codings of one model in a single table
+coding_table <- function(fit_dummy, fit_e05, fit_e1) {
+  coding_tab <- bind_rows(
+      coef_by_role(fit_dummy, "EmotionHappy", "dummy"),
+      coef_by_role(fit_e05,   "Emotion_e",    "e05"),
+      coef_by_role(fit_e1,    "Emotion_e1",   "e1")) %>%
+    transmute(Term = factor(Term, levels = term_order), Coding,
+              b  = round(estimate, 3),
+              SE = round(std.error, 3),
+              t  = round(statistic, 2),
+              p  = ifelse(p.value < .001, "< .001", sprintf("%.3f", p.value))) %>%
+    pivot_wider(names_from = Coding, values_from = c(b, SE, t, p),
+                names_glue = "{Coding}_{.value}") %>%
+    arrange(Term) %>%
+    select(Term, starts_with("dummy_"), starts_with("e05_"), starts_with("e1_"))
+
+  kable(coding_tab, col.names = c("Term", rep(c("b", "SE", "t", "p"), 3))) %>%
+    kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+    add_header_above(c(" " = 1,
+                       "Dummy (Angry = 0, Happy = 1)" = 4,
+                       "Effects (Angry = -0.5, Happy = +0.5)" = 4,
+                       "Effects (Angry = -1, Happy = +1)" = 4))
+}
+
+coding_table(fit_final, fit_final_effects, fit_final_effects1)
+
+b_dum <- fixef(fit_final)
+b_eff <- fixef(fit_final_effects)
+b_ef1 <- fixef(fit_final_effects1)
+```
+
+### What changed and what didn't?
+
+| Coefficient | Dummy (0/1) | Effects (±0.5) | Effects (±1) |
+|---|---|---|---|
+| Intercept | Angry faces, first presentation, average age: `r round(b_dum["(Intercept)"], 2)` µV | Average of Happy and Angry: `r round(b_eff["(Intercept)"], 2)` µV | Same as ±0.5: `r round(b_ef1["(Intercept)"], 2)` µV |
+| Emotion | Happy − Angry: `r round(b_dum["EmotionHappy"], 2)` µV | Happy − Angry: `r round(b_eff["Emotion_e"], 2)` µV | **Half** of Happy − Angry: `r round(b_ef1["Emotion_e1"], 2)` µV |
+| Presentation number | Habituation (both emotions): `r round(b_dum["PresentNum_True0"], 3)` µV | Same: `r round(b_eff["PresentNum_True0"], 3)` µV | Same: `r round(b_ef1["PresentNum_True0"], 3)` µV |
+| Age | Age effect for **Angry**: `r round(b_dum["Age_gmc"], 2)` µV | Age effect **averaged** over emotions: `r round(b_eff["Age_gmc"], 2)` µV | Same as ±0.5: `r round(b_ef1["Age_gmc"], 2)` µV |
+| Emotion × Age | Happy age effect − Angry age effect: `r round(b_dum["EmotionHappy:Age_gmc"], 3)` | Same as dummy: `r round(b_eff["Emotion_e:Age_gmc"], 3)` | **Half** of that: `r round(b_ef1["Emotion_e1:Age_gmc"], 3)` |
+
+**Dummy vs. effects coding changes the lower-order effects that interact
+with emotion** (the intercept and age). The effects-coded age effect sits
+halfway between the Angry and Happy age effects, so it equals the dummy-coded
+(Angry) age effect + ½ × the Emotion × Age interaction:
+`r round(b_dum["Age_gmc"], 2)` + ½ × `r round(b_dum["EmotionHappy:Age_gmc"], 2)` =
+`r round(b_dum["Age_gmc"] + 0.5 * b_dum["EmotionHappy:Age_gmc"], 2)` µV. (We simulated
+`r age_effect - emotion_age_int / 2` µV per year for Angry faces and `r age_effect`
+µV per year averaged over emotions. With only `r n_subjects` children, age is
+estimated imprecisely, so in another sample these estimates could land far from
+the simulated values; see the fixed-effects interpretation above.) Its *p*-value changes too, because it's now
+testing a different question (the average age effect instead of the Angry one).
+Presentation number doesn't interact with emotion, so it's the same in all
+three.
+
+**±0.5 vs. ±1 only rescales the emotion terms.** Happy and Angry are 2 units
+apart with ±1 coding, so the emotion coefficient (and every interaction with
+emotion) is the change per unit, which is *half* the Happy − Angry difference.
+The SEs are halved too, so the *t* and *p* values are identical to ±0.5. The
+intercept and the presentation number and age effects don't change at all.
+
+**Which age effect would you report?** With dummy coding, "the age effect" is
+really the age effect for Angry faces, which is steeper than for Happy faces.
+Reporting it as *the* age effect would overstate how much NC amplitude changes
+with age in general. The effects-coded estimate is the average over both
+emotions.
+
+### Marginal means don't depend on coding
+
+Instead of refitting with a different coding, you can keep the dummy-coded
+`fit_final` and get the effects you want from **estimated marginal means**
+(EMMs). `emmeans()` gives the model-estimated
+Nc for each emotion, and `emtrends()` gives the age effect (slope) for each
+emotion. These are predictions from the model, so they're the same no matter
+how Emotion is coded.
+
+```{r emmeans-coding}
+# Model-estimated mean Nc for each emotion (at the average age and presentation number)
+emm_coding <- emmeans(fit_final, ~ Emotion, lmer.df = "asymptotic")
+emm_coding
+pairs(emm_coding, reverse = TRUE)   # Happy - Angry
+
+# Age effect (µV per year) for each emotion, and averaged over both
+emt_coding <- emtrends(fit_final, ~ Emotion, var = "Age_gmc", lmer.df = "asymptotic")
+emt_coding
+emtrends(fit_final, ~ 1, var = "Age_gmc", lmer.df = "asymptotic")
+```
+
+- **Emotion:** at the average age and presentation number, Happy faces
+  elicited a less negative Nc than Angry faces (Happy − Angry =
+  `r sprintf("%.2f", summary(pairs(emm_coding, reverse = TRUE))$estimate)` µV).
+- **Age:** the age effect is
+  `r round(summary(emt_coding)$Age_gmc.trend[1], 2)` µV per year for Angry
+  faces and `r round(summary(emt_coding)$Age_gmc.trend[2], 2)` µV per year for
+  Happy faces, or
+  `r round(summary(emtrends(fit_final, ~ 1, var = "Age_gmc", lmer.df = "asymptotic"))$Age_gmc.trend, 2)`
+  µV per year averaged over both. These match the coefficients above:
+  the dummy-coded `Age_gmc` is the Angry slope, and the effects-coded
+  `Age_gmc` is the average.
+
+## Centering
+
+**Presentation number.** The intercept above is for the first presentation.
+To get it at the **average** presentation instead, we re-fit the model with
+`PresentNum_gmc` (presentation number minus its mean,
+`r mean(sim_data$PresentNum)`):
+
+**Your turn:** refit the final model with presentation number centered at the average presentation.
+
+```{r fit-final-centered-yourturn}
+# fit_final_centered <- lmer(MeanAmp ~ Emotion * Age_gmc + ___ +
+#                              (1 | SubjectID) + (1 | ActorID),
+#                            data = sim_data)
+#
+# tab_model(fit_final, fit_final_centered)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r fit-final-centered-catchup, class.source = "fold-hide"}
+fit_final_centered <- lmer(MeanAmp ~ Emotion * Age_gmc + PresentNum_gmc +
+                             (1 | SubjectID) + (1 | ActorID),
+                           data = sim_data)
+
+# Side-by-side: first presentation = 0 vs. average presentation = 0
+tab_model(fit_final, fit_final_centered,
+          dv.labels = c("PresentNum_True0", "PresentNum_gmc"))
+
+b_cen <- fixef(fit_final_centered)
+```
+
+Only the intercept changes (`r round(b_raw["(Intercept)"], 2)` →
+`r round(b_cen["(Intercept)"], 2)` µV): presentation number doesn't interact
+with anything, so the emotion effect, the age effect, and the interaction are
+identical. This is what Step 6 said: without an interaction, centering only
+changes the intercept.
+
+**Age.** Age *does* interact with emotion, so where age = 0 sits changes the
+meaning of the emotion effect. With raw age in years, `EmotionHappy` would be
+the emotion effect at age 0, a newborn, far outside our 3-to-5-year-olds:
+
+Without centering, the emotion coefficient (dummy coded) shows that Happy faces would be about 4 µV more negative than Angry faces in a newborn. That's the opposite direction of the +2.00 at the average age. 
+
+```{r fit-final-raw-age}
+fit_final_rawage <- lmer(MeanAmp ~ Emotion * AgeYears + PresentNum_gmc +
+                           (1 | SubjectID) + (1 | ActorID),
+                         data = sim_data)
+
+bind_rows(`Age_gmc (0 = average age)` = tidy(fit_final_centered, effects = "fixed"),
+          `AgeYears (0 = newborn)`   = tidy(fit_final_rawage, effects = "fixed"),
+          .id = "Model") %>%
+  filter(term == "EmotionHappy") %>%
+  select(Model, estimate, std.error, statistic) %>%
+  kable(digits = 2, col.names = c("Model", "EmotionHappy (µV)", "SE", "t value")) %>%
+  kable_styling(full_width = FALSE)
+
+b_rawage <- fixef(fit_final_rawage)
+```
+
+## Standardized betas as an effect size
+
+Raw coefficients are in different units (µV per presentation, µV per year), so
+they're hard to compare with each other or across studies. **Standardized
+betas** (β) put every effect in standard deviation (SD) units: the change in
+amplitude, in SDs, for a 1-SD change in the predictor. To get them, we standardize every variable (including mean amplitude) with `scale()`
+(subtract the mean, divide by the SD), name each one `_z`, and refit the final
+model:
+
+First, run this to standardize age (one value per child):
+
+```{r age-z}
+age_z <- sim_data %>%
+  distinct(SubjectID, AgeYears) %>%
+  mutate(Age_z = as.numeric(scale(AgeYears))) %>%
+  select(SubjectID, Age_z)
+```
+
+**Your turn:** standardize mean amplitude and presentation number, then refit the final model with the `_z` variables.
+
+```{r standardized-betas-yourturn}
+# sim_data_z <- sim_data %>%
+#   left_join(age_z, by = "SubjectID") %>%     # age_z is made in the catch-up chunk below
+#   mutate(MeanAmp_z    = as.numeric(scale(___)),
+#          PresentNum_z = as.numeric(scale(___)),
+#          Emotion_z    = as.numeric(scale(Emotion == "Happy")))
+#
+# fit_final_z <- lmer(___ ~ Emotion_z * Age_z + PresentNum_z +
+#                       (1 | SubjectID) + (1 | ActorID),
+#                     data = sim_data_z)
+#
+# summary(fit_final_z)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r standardized-betas-catchup, class.source = "fold-hide"}
+# Age is a child-level variable: scale it with one value per child, so children
+# with more trials don't count more toward the mean and SD
+age_z <- sim_data %>%
+  distinct(SubjectID, AgeYears) %>%
+  mutate(Age_z = as.numeric(scale(AgeYears))) %>%
+  select(SubjectID, Age_z)
+
+# Trial-level variables: scale across all trials
+sim_data_z <- sim_data %>%
+  left_join(age_z, by = "SubjectID") %>%
+  mutate(MeanAmp_z    = as.numeric(scale(MeanAmp)),
+         PresentNum_z = as.numeric(scale(PresentNum)),
+         Emotion_z    = as.numeric(scale(Emotion == "Happy")))   # balanced design, so Angry = -1, Happy = +1
+
+# The final model, with standardized variables
+fit_final_z <- lmer(MeanAmp_z ~ Emotion_z * Age_z + PresentNum_z +
+                      (1 | SubjectID) + (1 | ActorID),
+                    data = sim_data_z)
+
+# Standardized betas with 95% CIs
+beta_tab <- tidy(fit_final_z, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)")
+beta_tab %>%
+  transmute(Predictor = term,
+            `β` = round(estimate, 3),
+            `95% CI` = sprintf("[%.3f, %.3f]", conf.low, conf.high),
+            p = ifelse(p.value < .001, "< .001", sprintf("%.3f", p.value))) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+b_z <- setNames(beta_tab$estimate, beta_tab$term)
+```
+
+How to read them:
+
+- **Presentation number, β = `r round(b_z["PresentNum_z"], 2)`:** for each 1-SD
+  increase in presentation number (`r round(sd(sim_data$PresentNum), 1)`
+  presentations), amplitude changes by `r round(b_z["PresentNum_z"], 2)` SDs.
+- **Age, β = `r round(b_z["Age_z"], 2)`:** for each 1-SD increase in age
+  (`r round(sd(distinct(sim_data, SubjectID, AgeYears)$AgeYears), 2)` years),
+  amplitude changes by `r round(b_z["Age_z"], 2)` SDs.
+- **Emotion, β = `r round(b_z["Emotion_z"], 2)`:** emotion is binary, so a
+  "1-SD change" is less intuitive. With a balanced design, `Emotion_z` is −1
+  for Angry and +1 for Happy (2 units apart), so the Happy − Angry difference
+  is 2 × β = `r round(2 * b_z["Emotion_z"], 2)` SDs. If you'd rather report the
+  full difference directly, keep emotion at ±0.5 and standardize only the
+  outcome and the continuous predictors.
+
+### Checking the emotion effect with emmeans
+
+Three ways to get the Happy − Angry difference in SD units should all agree:
+
+1. **2 × β** from the fully standardized model (`Emotion_z` = −1 / +1).
+2. **The coefficient** from a model with emotion kept at **±0.5** (only the
+   outcome and the continuous predictors standardized). Angry and Happy are 1
+   unit apart, so no transformation is needed.
+3. **The pairwise comparison** of the estimated marginal means (EMMs) from the
+   raw model (in µV), divided by the SD of mean amplitude.
+
+**Your turn:** compare Happy vs. Angry with a pairwise comparison of the EMMs from the raw model.
+
+```{r emmeans-standardized-yourturn}
+# emm_raw <- emmeans(fit_final, ~ ___, lmer.df = "asymptotic")
+# pairs(___, reverse = TRUE)   # Happy - Angry, in µV
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r emmeans-standardized-catchup, class.source = "fold-hide"}
+# 2. Emotion at +/-0.5; outcome, age, and presentation number standardized
+fit_final_z05 <- lmer(MeanAmp_z ~ Emotion_e * Age_z + PresentNum_z +
+                        (1 | SubjectID) + (1 | ActorID),
+                      data = sim_data_z)
+
+# EMMs at Angry (-0.5) and Happy (+0.5), for average age and presentation number
+emm_z05 <- emmeans(fit_final_z05, ~ Emotion_e, at = list(Emotion_e = c(-0.5, 0.5)),
+                   lmer.df = "asymptotic")
+emm_z05
+pairs(emm_z05, reverse = TRUE)   # Happy - Angry, in SDs of amplitude
+
+# 3. The same comparison on the raw model, in µV
+emm_raw <- emmeans(fit_final, ~ Emotion, lmer.df = "asymptotic")
+emm_raw
+diff_raw <- pairs(emm_raw, reverse = TRUE)   # Happy - Angry, in µV
+diff_raw
+
+# All three, side by side
+tibble(Method = c("2 × β (Emotion_z = −1 / +1)",
+                  "Coefficient (Emotion = ±0.5, outcome standardized)",
+                  "EMM difference in µV ÷ SD of mean amplitude"),
+       `Happy − Angry (SD units)` = round(c(2 * fixef(fit_final_z)[["Emotion_z"]],
+                                            fixef(fit_final_z05)[["Emotion_e"]],
+                                            summary(diff_raw)$estimate / sd(sim_data$MeanAmp)), 3)) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+All three give the same Happy − Angry difference,
+`r round(fixef(fit_final_z05)[["Emotion_e"]], 2)` SDs: Happy faces elicited
+an Nc `r round(fixef(fit_final_z05)[["Emotion_e"]], 2)` SDs less negative than
+Angry faces (for a child of average age). The EMMs and their pairwise
+comparison work on the raw model too, which is often the easiest way to report
+a condition difference: in µV (`r round(summary(diff_raw)$estimate, 2)` µV)
+and, if you need it, in SD units.
+
+A few things to keep in mind:
+
+- **The t and p values don't change.** Standardizing only rescales each
+  variable, so the tests are the same as in the unstandardized model.
+- **The "SD" is the total SD of amplitude**, which includes differences
+  between children and actors, not just trial-to-trial noise. Standardized
+  betas from an LME aren't directly comparable to Cohen's *d* from a *t*-test
+  on averaged data.
+- **Report both**: unstandardized b (in µV, which ERP readers can picture) and
+  standardized β (to compare effects and studies).
+
+
+## Reporting in APA style
+
+**My recommendation:** put every fixed effect in a **table** (maybe in Supplement), and in the text
+report *b*, *SE*, *p*, and β for the effects you discuss.
+
+The table below uses the effects-coded final model (`fit_final_effects`), so
+each term is averaged over emotions, and the standardized β's from
+`fit_final_z` in the section above.
+
+```{r apa-table}
+# APA formatting helpers: 2 decimals with a real minus sign; p with 3 decimals and no leading zero
+f2 <- function(x) sub("-", "−", sprintf("%.2f", x))
+fp <- function(p) ifelse(p < .001, "< .001", sub("^0", "", sprintf("%.3f", p)))
+
+raw_tab <- tidy(fit_final_effects, effects = "fixed", conf.int = TRUE)   # b, SE, 95% CI, t, df, p
+std_tab <- tidy(fit_final_z, effects = "fixed")                          # beta (same term order)
+
+apa_tab <- raw_tab %>%
+  mutate(beta = std_tab$estimate) %>%
+  transmute(Predictor = c("Intercept", "Emotion (Happy − Angry)", "Age (years, centered)",
+                          "Presentation number", "Emotion × Age"),
+            b = f2(estimate),
+            SE = f2(std.error),
+            `95% CI` = paste0("[", f2(conf.low), ", ", f2(conf.high), "]"),
+            t = f2(statistic),
+            df = ifelse(abs(df - round(df)) < .005, sprintf("%.0f", df), sprintf("%.2f", df)),
+            p = fp(p.value),
+            `β` = ifelse(term == "(Intercept)", "", f2(beta)))
+
+apa_tab %>%
+  kable(caption = "Fixed effects of the final model (effects coding: Angry = −0.5, Happy = +0.5)") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+age_raw <- filter(raw_tab, term == "Age_gmc")
+age_std <- filter(std_tab, term == "Age_z")
+```
+
+**In the text**, for the age effect:
+
+> Averaged over emotions, age `r ifelse(age_raw$p.value < .05, "was", "was not")` significantly associated with Nc amplitude,
+> *b* = `r f2(age_raw$estimate)`, *SE* = `r f2(age_raw$std.error)`,
+> *p* = `r fp(age_raw$p.value)`, β = `r f2(age_std$estimate)` (see Table 1).
+
+
+## Random effects
+
+- σ2 = residual variance (trial-level variability)
+- τ00 = random intercept variance (how much baseline amplitude differs by participant/actor)
+- Variance is SD-squared, so taking the sqrt of variance estimates gives you SD (easier to interpret)
+- e.g., variance of ~100 for subjectID means that sqrt(100) is equal to SD = 10 (participants' amplitudes differ from the overall intercept by ~10 microV)
+- ICC = intraclass correlation coefficient (proportion of total variance due to differences between subjects + actors = ~66%)
+
+These random-effect estimates are identical for `fit_final` and
+`fit_final_centered`: centering a fixed-effect predictor doesn't change the
+random intercept variances when the model has no random slopes.
+
+If we're interested in what variance is attributed to participant variability vs. actor variability we can run:
+**Your turn:** how much of the variance is due to participants vs. actors?
+
+```{r icc-yourturn}
+# icc(___, by_group = TRUE)
+```
+
+**Catch up:** run this chunk either way. It has the full code for this step, so if you got stuck or fell behind, you can keep going from here.
+
+```{r icc-catchup, class.source = "fold-hide"}
+icc(fit_final, by_group = T)
+```
+
+---
+
+# Common errors
+
+## Error 1: Misspecifying the random-effects grouping structure
+
+A subtler error: treating a within-subjects/crossed factor as if it were a
+simple grouping factor, or vice versa. For example, `Emotion` in our design
+is **crossed** with participants (everyone sees both emotions) — it should
+never appear as a *grouping* variable like `(1 | Emotion)`, only inside the
+random-effects term as a variable that's allowed to have a random *slope*
+(e.g. `(1 + Emotion | SubjectID)`). Writing `(1 | Emotion)` fits a model
+that treats "Happy" and "Angry" as if they were two random draws from a
+larger population of possible emotions — nonsensical here, since we
+deliberately chose these two conditions:
+
+```{r fit-error-grouping}
+fit_wrong_grouping <- lmer(MeanAmp ~ PresentNum + Age_gmc + (1 | SubjectID) + (1 | Emotion),
+                            data = sim_data, REML = TRUE)
+summary(fit_wrong_grouping)
+```
+
+Notice `Emotion` now has only 2 levels in its random-effect variance
+component — R will fit this without erroring, which is exactly what makes
+it dangerous. **A grouping factor with fewer than ~5 levels should almost
+never be modeled as a random effect** (Volpert-Esmond et al., 2021);
+instead it belongs as a *fixed* effect, as in our final model (`fit_final`). Always
+sanity-check `summary(fit)$ngrps` or `VarCorr(fit)` to confirm the number
+of levels going into each random-effect grouping factor matches what you
+intended.
+
+```{r check-ngrps}
+summary(fit_final)$ngrps
+```
+
+
+## Error 2: Splitting one grouping factor across random-effects terms
+
+It's tempting to write each random slope in its own set of parentheses, e.g.
+`(1 + Emotion | SubjectID) + (1 + PresentNum_True0 | SubjectID)`. But each set
+of parentheses includes its own `1`, so this fits **two separate random
+intercepts** for SubjectID, which the model can't tell apart. It splits the
+participant intercept variance across the two terms (`SubjectID` and
+`SubjectID.1` below) and is itself a cause of singular fits:
+
+```{r duplicate-intercepts, warning=TRUE}
+fit_dup <- lmer(MeanAmp ~ Emotion * PresentNum_True0 + Emotion * Age_gmc +
+                  (1 + Emotion | SubjectID) + (1 + PresentNum_True0 | SubjectID) +
+                  (1 | ActorID),
+                data = sim_data)
+check_fit(fit_dup)
+```
+
+Put all slopes for a grouping factor in one term:
+`(1 + Emotion + PresentNum_True0 | SubjectID)`. If you want a slope *without*
+its own intercept, use `0 +`, e.g. `(1 + Emotion | SubjectID) + (0 + PresentNum_True0 | SubjectID)`.
+
+
+
+# About these materials
+
+These materials were developed for the Society for Psychophysiological
+Research pre-conference workshop "Linear mixed effects models for
+event-related potential research" (October 14, 2026, Halifax, Canada) by
+Megan J. Heise.
+
+Heise, M. J. (2026, October 14). *Linear mixed effects
+models for event-related potential research* [Workshop materials]. Society
+for Psychophysiological Research Annual Meeting, Halifax, Nova Scotia, Canada.
+
+# Helpful articles for more discussions of mixed effects models & examples
+
+- Heise, M. J., Mon, S. K., & Bowman, L. C. (2022). Utility of linear mixed
+  effects models for event-related potential research with infants and
+  children. *Developmental Cognitive Neuroscience, 54*, 101070.
+  <https://doi.org/10.1016/j.dcn.2022.101070>
+- Tutorial scripts and example data:
+  <https://github.com/basclab/LME_MixedEffectsERPTutorial>
+- Barr, D. J., Levy, R., Scheepers, C., & Tily, H. J. (2013). Random effects
+  structure for confirmatory hypothesis testing: Keep it maximal.
+  *Journal of Memory and Language, 68*(3), 255–278.
+- Brauer, M., & Curtin, J. J. (2018). Linear mixed-effects models and the
+  analysis of nonindependent data. *Psychological Methods, 23*(3), 389–411.
+- Matuschek, H., Kliegl, R., Vasishth, S., Baayen, H., & Bates, D. (2017).
+  Balancing Type I error and power in linear mixed models.
+  *Journal of Memory and Language, 94*, 305–315.
+- Volpert-Esmond, H. I., Page-Gould, E., & Bartholow, B. D. (2021). Using
+  multilevel models for the analysis of event-related potentials.
+  *International Journal of Psychophysiology, 162*, 145–156.
+- Schielzeth, H., Dingemanse, N. J., Nakagawa, S., Westneat, D. F., Allegue,
+  H., Teplitsky, C., Réale, D., Dochtermann, N. A., Garamszegi, L. Z., &
+  Araya-Ajoy, Y. G. (2020). Robustness of linear mixed-effects models to
+  violations of distributional assumptions. *Methods in Ecology and
+  Evolution, 11*(9), 1141–1152.
+- Kristjansson, S. D., Kircher, J. C., & Webb, A. K. (2007). Multilevel models for repeated measures research designs in psychophysiology: An introduction to growth curve modeling. Psychophysiology, 44(5), 728-736. https://doi.org/10.1111/j.1469-8986.2007.00544.x
+- Page-Gould, E. (2017). Multilevel modeling. In J. T. Cacioppo, L. G. Tassinary, & G. G. Berntson (Eds.), Handbook of psychophysiology (4th ed., pp. 662–678). Cambridge University Press.
+- Tremblay, A., & Newman, A. J. (2015). Modeling nonlinear relationships in ERP data using mixed-effects regression with R examples. Psychophysiology, 52(1), 124-139. https://doi.org/10.1111/psyp.12299
+- Vossen, H., van Breukelen, G., Hermens, H., van Os, J., & Lousberg, R. (2011). More potential in statistical analyses of event-related potentials: A mixed regression approach. International Journal of Methods in Psychiatric Research, 20(3), e56-e68. https://doi.org/10.1002/mpr.348
+- Mon, S. K., Manning, B. L., Wakschlag, L. S., & Norton, E. S. (2024). Leveraging mixed-effects location scale models to assess the ERP mismatch negativity’s psychometric properties and trial-by-trial neural variability in toddler-mother dyads. Developmental Cognitive Neuroscience, 70, Article 101459. https://doi.org/10.1016/j.dcn.2024.101459

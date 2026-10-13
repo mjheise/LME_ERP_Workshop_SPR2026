@@ -1,0 +1,833 @@
+---
+title: "Fitting LMEs to ERP Data: Auditory Oddball (MMN) Code-Along"
+subtitle: "Single-trial MMN difference waves"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+options(width = 120)  # wide enough that VarCorr() and summary() tables don't wrap
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7, fig.height = 5)
+
+# Packages -----------------------------------------------------------------
+library(tidyverse)    # data wrangling & plotting
+library(lme4)         # fit LME models
+library(lmerTest)     # Satterthwaite p-values for LME models
+library(sjPlot)       # formatted LME output
+library(emmeans)      # estimated marginal means
+library(performance)  # check_convergence, check_singularity, check_model, check_collinearity
+library(kableExtra)   # formatted tables
+```
+
+# Overview
+
+This is the **code-along** version of Example 2. In the workshop, Example 1
+(the face-emotion study) walked through every line of code with you. This time
+**you're in the driver's seat**: we give you the data, the research question,
+and hints, and you write the code and make the modeling decisions.
+
+We'll model the mismatch negativity (MMN) from an **auditory oddball**
+(participants hear a frequent **standard** sound and a rare **deviant** sound)
+**trial by trial**: each deviant is paired with the standard right before it,
+and the outcome is their difference, a **single-trial MMN difference wave** (as
+in Mon et al., 2024).
+
+The full worked version is `LME_ex2_oddball.Rmd`, and a supplement
+(`LME_ex2_supplement_interaction.Rmd`) fits the same data as a Condition × Age
+interaction instead of a difference wave.
+
+## How to use this code-along
+
+- **"Your turn" chunks** are mostly empty. Each one comes with a task and
+  hints (which functions to use, what to check). Write the code yourself;
+  Example 1 and the slides are fair game to copy from.
+- **"Solution / catch up" chunks** come right after each "Your turn". Their
+  code is folded: click **Code** to see it. **Run each one either way:** if your
+  code worked, it just recreates the same objects (with the names the next
+  steps use); if you got stuck, fell behind, or got an error, it fills in the
+  step for you.
+- **"Show answer" boxes** hold our answers to the questions (and our
+  modeling decisions). Decide for yourself first, then click to compare.
+  There's often more than one defensible answer.
+- **Lost completely?** Click on the next chunk and use **Run All Chunks Above**
+  (the ▼ button at the top right of the chunk, or Ctrl+Alt+P / Cmd+Option+P).
+  That runs everything before it, including the solution chunks, so you can
+  pick up at any step.
+
+---
+
+# Simulating an Oddball Study
+
+## Study design
+
+*Read this section and run the chunks as they are: you don't need to change anything until the descriptive statistics.*
+
+**Our simulation** is loosely based on oddball designs like those in Mon et
+al. (2024) and Coy et al. (2024):
+
+- **Participants:** 40, aged 2 to 4 years
+- **Stimuli:** a standard syllable /ba/ and a deviant /da/, with the deviant
+  recorded by 6 speakers (6 **recordings/speakers**, or "tokens")
+- **Trials:** 600 standards and 150 deviants (25 per token) per participant
+- **Outcome:** a single-trial MMN for every deviant: the deviant minus the
+  standard right before it
+
+The population values for the MMN come from Coy et al. (2024, Table 1):
+
+- Standard: ~**1.9 µV**; deviant: ~**0 µV**, so the MMN is ~**−1.9 µV**
+- SD of the MMN across participants: 0.148 × √60 ≈ **1.15 µV**
+- SD of the standard amplitude across participants: 0.187 × √60 ≈ **1.45 µV**
+
+The additional parameters (habituation, the token and age effects, and the
+single-trial noise) are our own choices.
+
+```{r design-params}
+# Study design parameters --------------------------------------------------
+n_subjects     <- 40     # number of participants
+n_tokens       <- 6      # recordings/speakers of the deviant /da/
+dev_per_token  <- 25     # deviants per token per participant
+n_deviant      <- n_tokens * dev_per_token   # 150 deviants per participant
+n_standard     <- 4 * n_deviant              # 600 standards per participant (80% of trials)
+
+# Population-level parameters (MMN size and variability from Coy et al., 2024) --
+mean_amp_standard <- 1.9    # mean amplitude for standards (µV)
+mmn_effect        <- -1.9   # MMN (deviant - standard) at the middle of the session (µV)
+subject_int_sd    <- 1.45   # SD of participants' standard amplitude
+subject_mmn_sd    <- 1.15   # SD of participants' MMN (random intercept in the MMN model)
+int_mmn_cor       <- -0.3   # correlation between participants' standard amplitude and MMN
+
+# Additional parameters ---------------------------------------------------------
+hab_effect        <- 0.15   # MMN becomes less negative by this much per 10 deviants (habituation)
+subject_hab_sd    <- 0.2    # participants habituate at different rates (SD per 10 deviants)
+age_effect        <- -0.5   # MMN becomes more negative by this much per year of age
+token_sd          <- 0.5    # some /da/ recordings/speakers elicit a larger MMN than others
+trial_noise_sd    <- 7      # single-trial noise SD (each trial, standard or deviant)
+
+set.seed(2026)
+```
+
+## Building the trial-level dataset
+
+Each simulated participant hears a sequence in which every deviant follows at
+least two standards (so every deviant has a standard right before it, as in
+typical oddball designs). Each simulated participant gets their own standard
+amplitude, MMN size, and habituation rate, and each /da/ token has its own MMN
+shift.
+
+```{r simulate-data}
+subject_ids <- sprintf("%02d", 1:n_subjects)
+
+# Participant-level random effects: correlated standard amplitude + MMN, habituation rate, age
+re_cov <- matrix(c(subject_int_sd^2,
+                   int_mmn_cor * subject_int_sd * subject_mmn_sd,
+                   int_mmn_cor * subject_int_sd * subject_mmn_sd,
+                   subject_mmn_sd^2), nrow = 2)
+subject_re <- MASS::mvrnorm(n_subjects, mu = c(0, 0), Sigma = re_cov) %>%
+  as_tibble(.name_repair = ~ c("subj_intercept", "subj_mmn")) %>%
+  mutate(SubjectID = subject_ids,
+         subj_hab  = rnorm(n_subjects, 0, subject_hab_sd),
+         AgeYears  = round(runif(n_subjects, 2, 4), 1))
+
+# Token-level random effects
+token_re <- tibble(Token = paste0("da", 1:n_tokens),
+                   token_mmn = rnorm(n_tokens, 0, token_sd))
+
+# One participant's sequence: each deviant follows at least 2 standards; the remaining
+# standards are spread at random, and the 6 tokens appear in random order
+make_sequence <- function() {
+  extra <- as.vector(rmultinom(1, n_standard - 2 * n_deviant, rep(1, n_deviant)))
+  tokens <- sample(rep(paste0("da", 1:n_tokens), dev_per_token))
+  map2_dfr(2 + extra, seq_len(n_deviant), function(k, i)
+    tibble(Condition = c(rep("Standard", k), "Deviant"),
+           Token     = c(rep(NA, k), tokens[i])))
+}
+
+oddball_data <- map_dfr(subject_ids, ~ make_sequence() %>% mutate(SubjectID = .x)) %>%
+  group_by(SubjectID) %>%
+  mutate(TrialNum = row_number(),
+         DevNum   = if_else(Condition == "Deviant", cumsum(Condition == "Deviant"), NA_integer_)) %>%
+  ungroup() %>%
+  left_join(subject_re, by = "SubjectID") %>%
+  left_join(token_re, by = "Token") %>%
+  mutate(
+    # the MMN on this deviant: average MMN + participant + habituation + age + token
+    mmn = if_else(Condition == "Deviant",
+                  mmn_effect + subj_mmn +
+                    (hab_effect + subj_hab) * (DevNum - mean(1:n_deviant)) / 10 +
+                    age_effect * (AgeYears - 3) + token_mmn,
+                  0),
+    MeanAmp   = mean_amp_standard + subj_intercept + mmn + rnorm(n(), 0, trial_noise_sd),
+    Condition = factor(Condition, levels = c("Standard", "Deviant"))
+  ) %>%
+  select(SubjectID, AgeYears, TrialNum, Condition, Token, DevNum, MeanAmp)
+
+glimpse(oddball_data)
+```
+
+## Single-trial difference waves
+
+We pair each deviant with the **standard immediately before it** and subtract:
+MMN = deviant − preceding standard. Each pair is one row in the analysis
+dataset. We also keep the standard and deviant amplitudes themselves, so that
+the same pairs can be modeled as a Condition × Age **interaction**
+instead of a difference wave (see the supplement, `LME_ex2_supplement_interaction.Rmd`).
+
+```{r difference-waves}
+mmn_data <- oddball_data %>%
+  group_by(SubjectID) %>%
+  mutate(prev_condition = lag(Condition),
+         prev_amp       = lag(MeanAmp)) %>%
+  ungroup() %>%
+  filter(Condition == "Deviant", prev_condition == "Standard") %>%
+  transmute(SubjectID, AgeYears, Token, DevNum,
+            Standard = prev_amp,            # the standard right before the deviant
+            Deviant  = MeanAmp,             # the deviant
+            MMN      = Deviant - Standard)  # single-trial difference wave
+
+glimpse(mmn_data)
+
+# Pairs per participant (every deviant here has a standard right before it)
+mmn_data %>% count(SubjectID) %>% summarise(min = min(n), max = max(n))
+```
+
+A few things to notice:
+
+- **Only the standards right before a deviant are used** (150 of each
+  participant's 600). In real data, a pair is lost whenever *either* trial is
+  rejected, so you can lose more data than with averaging (Mon et al., 2024). In our simulation, we won't simulate any missing data.
+- **Difference waves have more noise than amplitude in a single condition.** Each pair contains the noise from two trials, so the
+  single-trial noise SD of the MMN is about √2 × `r trial_noise_sd` ≈
+  `r round(sqrt(2) * trial_noise_sd, 1)` µV.
+
+# Descriptive Statistics & Data Visualization
+
+**Your turn:** before modeling, look at the data. Make (at least) these plots
+with `mmn_data`:
+
+1. The distribution of the single-trial MMNs (`geom_histogram()`).
+2. Each participant's MMN across the session. Single trials are very noisy, so
+   average them in blocks first (e.g., `Block = ceiling(DevNum / 25)`, then
+   `group_by(SubjectID, Block)` and `summarise()`), and draw one line per
+   participant (`aes(group = SubjectID)`).
+3. Each participant's mean MMN for each `/da/` token.
+
+What do you notice? Is there an MMN on average? Does it change over the
+session? Do the tokens differ?
+
+```{r data-plotting-solution, class.source = "fold-hide"}
+# Distribution of single-trial MMNs
+ggplot(mmn_data, aes(x = MMN)) +
+  geom_histogram(bins = 50, fill = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(x = "Single-trial MMN: deviant − preceding standard (µV)", y = "Count",
+       title = "Single-trial MMN difference waves")
+
+# Each participant's MMN across the session (averaged in blocks of 25 deviants)
+mmn_data %>%
+  mutate(Block = ceiling(DevNum / 25)) %>%
+  group_by(SubjectID, Block) %>%
+  summarise(MMN = mean(MMN), .groups = "drop") %>%
+  ggplot(aes(x = Block, y = MMN, group = SubjectID)) +
+  geom_line(alpha = 0.25) +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", linewidth = 1.5, color = "#D55E00") +
+  scale_x_continuous(breaks = 1:6, labels = paste0(seq(1, 126, 25), "–", seq(25, 150, 25))) +
+  theme_minimal() +
+  labs(x = "Deviants", y = "Mean MMN (µV)",
+       title = "MMN across the session (orange = average)")
+
+# MMN for each /da/ token: each participant's mean MMN for that token
+mmn_data %>%
+  group_by(SubjectID, Token) %>%
+  summarise(MMN = mean(MMN), .groups = "drop") %>%
+  ggplot(aes(x = Token, y = MMN)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_violin(fill = "#3D6080", alpha = 0.25, color = NA) +
+  geom_jitter(width = 0.08, alpha = 0.35, size = 1) +
+  stat_summary(fun = mean, geom = "point", size = 3.5, color = "#D55E00") +
+  theme_minimal() +
+  labs(x = "/da/ token (recording/speaker)", y = "Participant's mean MMN (µV)",
+       title = "MMN for each /da/ recording/speaker",
+       subtitle = "Violins and gray points = participants' means; orange = token mean")
+
+# Each participant's mean MMN across tokens
+ggplot(aes(x = SubjectID, y = MMN, color = Token), data = mmn_data) +
+  geom_jitter(width = 0.25, alpha = 0.35, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_jitter(width = 0.08, alpha = 0.35, size = 1) +
+  stat_summary(fun = mean, geom = "point", size = 2, color = "pink") +
+  theme_minimal() +
+  labs(x = "Subject ID", y = "Participant's mean MMN (µV)",
+       title = "Distribution of single-trial MMNs for each participant")
+```
+
+# Fitting an LME: the 9 steps
+
+## Step 1: Define the research question
+
+**Your turn:** write the research question in one sentence. (Hint: look at the
+study design. Which participant-level variable did we vary?)
+
+<details>
+<summary>Show answer</summary>
+
+Does the MMN change with age?
+
+</details>
+
+## Step 2: List all relevant variables
+
+**Your turn:** list the variables you'll need from `mmn_data` (run
+`glimpse(mmn_data)`). Which is the outcome?
+
+```{r list-variables-yourturn}
+
+```
+
+<details>
+<summary>Show answer</summary>
+
+- `MMN`: single-trial difference wave (deviant − preceding standard), the outcome
+- `AgeYears`: participant's age
+- `DevNum`: presentation number of the deviant (1st, 2nd, … 150th)
+- `SubjectID`: participant
+- `Token`: which /da/ recording/speaker was played
+
+</details>
+
+## Step 3: Draw the study design schematic
+
+**Your turn:** sketch the design on paper first. Which grouping factors are
+there? Are they crossed or nested? Then run the chunk below to compare.
+
+```{r design-diagram-solution, fig.height=5.5, class.source = "fold-hide"}
+subj_nodes  <- tibble(label = c("Subject 01", "Subject 02", "Subject 03", "…",
+                                paste("Subject", n_subjects)),
+                      x = 1:5, y = 2)
+token_nodes <- tibble(label = paste0("/da/ ", 1:n_tokens),
+                      x = seq(0.8, 5.2, length.out = n_tokens), y = 1)
+pair_nodes  <- token_nodes %>% mutate(y = 0, label = "std → dev")
+edges <- expand_grid(x = subj_nodes$x[subj_nodes$label != "…"],
+                     xend = token_nodes$x)
+
+ggplot() +
+  geom_segment(data = edges, aes(x = x, xend = xend, y = 2, yend = 1), colour = "grey75") +
+  geom_segment(data = token_nodes, aes(x = x, xend = x, y = 1, yend = 0), colour = "grey45") +
+  geom_label(data = filter(subj_nodes, label != "…"), aes(x, y, label = label),
+             fill = "#9CAF88", colour = "white", fontface = "bold") +
+  geom_text(data = filter(subj_nodes, label == "…"), aes(x, y, label = label), size = 6) +
+  geom_label(data = token_nodes, aes(x, y, label = label),
+             fill = "#3D6080", colour = "white", fontface = "bold") +
+  geom_label(data = pair_nodes, aes(x, y, label = label),
+             fill = "#D55E00", colour = "white", fontface = "bold", size = 3) +
+  annotate("label", x = 3, y = 1.5, fill = "white", size = 3.5,
+           label = "every subject hears every /da/ token") +
+  annotate("text", x = 3, y = -0.38, size = 3.5, fontface = "italic",
+           label = paste0("each token: ", dev_per_token,
+                          " deviants per subject, \neach paired with the standard before it  →  ",
+                          n_subjects, " × ", n_tokens, " × ", dev_per_token, " = ",
+                          n_subjects * n_deviant, " single-trial MMNs")) +
+  labs(title = "Subjects and tokens are crossed") +
+  scale_x_continuous(expand = expansion(add = 0.5)) +
+  scale_y_continuous(expand = expansion(add = 0.3)) +
+  theme_void(base_size = 12)
+```
+
+## Step 4: Categorize variables by type & level (trial vs. subject)
+
+**Your turn:** for each variable from Step 2, is it continuous or categorical?
+Does it vary from trial to trial, or only between participants? Which ones are
+grouping factors?
+
+<details>
+<summary>Show answer</summary>
+
+- `MMN`: continuous, trial-level (outcome)
+- `AgeYears`: continuous, participant-level
+- `DevNum`: continuous, trial-level
+- `Token`: categorical, trial-level (grouping factor: a sample of possible recordings/speakers)
+- `SubjectID`: categorical, participant-level (grouping factor)
+
+</details>
+
+## Step 5: Assign fixed and random effects
+
+**Your turn:**
+
+1. Which **fixed effects** do you need? One answers the research question;
+   is there a covariate that could matter in a long oddball session?
+2. For each grouping factor, list the **possible random effects**, and write
+   each as a question ("Do participants differ in …?"). Hint: a random slope
+   only makes sense if the predictor varies *within* that grouping factor.
+   Can participants differ in their age effect?
+3. Write the **maximal model** as an `lmer()` formula. Is there more than one
+   reasonable maximal model, depending on your hypothesis?
+
+<details>
+<summary>Show answer</summary>
+
+**Fixed effects**
+
+- Age (our research question)
+- Presentation number (a covariate: the MMN may habituate over the session)
+
+**Possible random effects in our design**
+
+*SubjectID*
+
+- `(1 | SubjectID)`: Do participants differ in the size of their MMN?
+- `(1 + DevNum | SubjectID)`: Do participants habituate at different rates?
+
+*Token*
+
+- `(1 | Token)`: Do some /da/ recordings/speakers elicit a larger MMN than others?
+- `(1 + DevNum | Token)`: Does the MMN habituate faster for some recordings/speakers?
+- `(1 + Age | Token)`: Does the age effect differ across recordings/speakers?
+
+There is no `(1 + Age | SubjectID)`: each participant has only one age, so
+participants can't differ in an age effect.
+
+**Two possible maximal models**
+
+The maximal model depends on your hypothesis. Either of these is reasonable:
+
+**A. Habituation is the same at every age.** Presentation number and age are
+separate fixed effects:
+
+```
+MMN ~ DevNum_gmc + Age_gmc +
+      (1 + DevNum_gmc | SubjectID) +
+      (1 + DevNum_gmc + Age_gmc | Token)
+```
+
+**B. The habituation rate changes with age.** If you expected older children's
+MMNs to fade faster (or slower) over the session, you would add the
+**DevNum × Age interaction**. Random slopes only include terms that are in the
+fixed effects, so the by-token slopes get the interaction too (tokens could
+differ in how much age changes habituation). Participants still get only a
+habituation slope, because each has one age:
+
+```
+MMN ~ DevNum_gmc * Age_gmc +
+      (1 + DevNum_gmc | SubjectID) +
+      (1 + DevNum_gmc * Age_gmc | Token)
+```
+
+Our research question is about the age effect on the MMN, not whether
+habituation changes with age, so **we fit Model A**. With Model B, the by-token
+interaction slope would be the first thing to remove in Step 7: it's the least
+plausible, and with only six tokens it can't be estimated.
+
+</details>
+
+## Step 6: Consider data transformations & center predictors
+
+**Your turn:** add two new columns to `mmn_data`:
+
+- `DevNum_gmc`: presentation number, **grand-mean centered** and expressed in
+  **units of 10 deviants** (divide by 10). Why rescale? `DevNum` runs from 1 to
+  150, so a slope per single deviant is tiny, and tiny variance components make
+  the model hard to estimate.
+- `Age_gmc`: age, grand-mean centered. Careful: each participant has 150 rows,
+  so compute the mean age from **one row per participant** (`distinct()`), and
+  keep it as `age_grandmean` (we use it again to plot).
+
+What will the intercept mean after centering?
+
+```{r center-predictors-yourturn}
+
+```
+
+**Solution / catch up:** run this chunk either way (click **Code** to see it).
+
+```{r center-predictors-solution, class.source = "fold-hide"}
+age_grandmean <- mean(distinct(mmn_data, SubjectID, AgeYears)$AgeYears)   # one value per participant
+
+mmn_data <- mmn_data %>%
+  mutate(DevNum_gmc = (DevNum - mean(DevNum)) / 10,   # grand-mean centered, in units of 10 deviants
+         Age_gmc    = AgeYears - age_grandmean)         # grand-mean centered age
+
+mmn_data %>% select(SubjectID, Token, DevNum, DevNum_gmc, AgeYears, Age_gmc, MMN) %>% head()
+```
+
+<details>
+<summary>Show answer</summary>
+
+The intercept is the MMN **in the middle of the session for a participant of average age**. 
+</details>
+
+## Step 7: Fit the maximal model and simplify until convergence is reached
+
+Run this helper (the same one as in Example 1). It prints whether a fit is
+singular and the random-effect SDs and correlations:
+
+```{r check-fit-helper}
+check_fit <- function(fit) {
+  cat("Singular fit:", isSingular(fit), "\n\n")
+  print(VarCorr(fit), comp = "Std.Dev.")  # random-effect SDs and correlations
+}
+```
+
+### Step 7a: Fit the maximal model
+
+**Your turn:** fill in the random slopes for participants and for tokens
+(Model A from Step 5), then run the chunk.
+
+```{r maximal-model-yourturn}
+# fit_max <- lmer(MMN...)
+```
+
+**Solution / catch up:** run this chunk either way (click **Code** to see it).
+
+```{r maximal-model-solution, warning=TRUE, class.source = "fold-hide"}
+fit_max <- lmer(MMN ~ DevNum_gmc + Age_gmc +
+                  (1 + DevNum_gmc | SubjectID) +          # participants differ in MMN size and habituation
+                  (1 + DevNum_gmc + Age_gmc | Token),     # tokens differ in MMN size, habituation, age effect
+                data = mmn_data)
+
+check_fit(fit_max)
+```
+
+<details>
+<summary>What do the variance components tell us?</summary>
+
+- **Token:** the slope SDs are small and the correlations are at ±1. With only
+  `r n_tokens` tokens, there isn't enough information to estimate how tokens
+  differ in habituation or age effects.
+- **SubjectID:** the habituation slope SD isn't near 0, and the correlation
+  isn't at ±1.
+
+</details>
+
+### Steps 7b–7d: Simplifying the model 
+
+```{r model-simplification}
+
+```
+
+
+<details>
+<summary>Show the simplification path</summary>
+
+**Round 1: the by-token age slope** (starting from the maximal model, Step 7a)
+
+- Remove the by-token age slope:
+  `(1 + DevNum_gmc | SubjectID) + (1 + DevNum_gmc | Token)`
+  → still singular: the by-token habituation slope is tiny and correlated −1
+  with the token intercept.
+
+**Round 2: the habituation slopes**
+
+- Remove the by-token habituation slope:
+  `(1 + DevNum_gmc | SubjectID) + (1 | Token)`
+  → not singular. lme4 gives a borderline convergence warning, which turns out to be a false alarm (see below): **this is our final random-effects
+  structure**, so we stop here.
+- *If that hadn't worked*, we would put it back and remove the by-participant
+  habituation slope instead:
+  `(1 | SubjectID) + (1 + DevNum_gmc | Token)`
+  → this one is singular (the by-token slope is again correlated −1 with the
+  intercept), so it wouldn't have been an option anyway.
+- *And if neither had worked*, we would remove both:
+  `(1 | SubjectID) + (1 | Token)` (random intercepts only).
+
+</details>
+
+
+**Solution / catch up:** run this chunk either way (click **Code** to see it).
+
+```{r final-model-solution, warning=TRUE, class.source = "fold-hide"}
+fit_final <- lmer(MMN ~ DevNum_gmc + Age_gmc +
+                    (1 + DevNum_gmc | SubjectID) +
+                    (1 | Token),
+                    data = mmn_data,
+                    control = lmerControl(optimizer = "bobyqa"))
+
+check_fit(fit_final)
+performance::check_convergence(fit_final)
+
+```
+
+**Your turn:** write two or three sentences for your methods section
+describing how you simplified the model.
+
+<details>
+<summary>Show our version</summary>
+
+*"We began with the maximal random-effects structure (Barr et al., 2013) and
+simplified it one term at a time until the model converged without a singular
+fit, starting with the by-token random slopes (only six tokens): first the
+by-token slope of age, then the by-token slope of presentation number. The
+final model, fit with the bobyqa optimizer, included by-participant random
+intercepts and random slopes of presentation number, a by-token random
+intercept, and fixed effects of presentation number (grand-mean centered, in
+units of 10 deviants) and age (grand-mean centered)."*
+
+</details>
+
+## Step 8: Check model assumptions
+
+**Your turn:** check the model's assumptions with `check_model()` With this many 
+trials, should you use formal tests or visual inspection? 
+
+```{r check-model-yourturn, fig.width=10, fig.height=12}
+
+```
+
+**Solution / catch up:** run this chunk either way (click **Code** to see it).
+
+```{r check-model-solution, fig.width=10, fig.height=12, class.source = "fold-hide"}
+check_model(fit_final)  
+```
+
+<details>
+<summary>Show answer</summary>
+
+With `r format(nobs(fit_final), big.mark = ",")` single-trial MMNs, formal tests (e.g., Shapiro-Wilk for normality or a test for heteroscedasticity) can be significant even when there are only small deviations from the assumption. Some researchers recommend Shapiro-Wilk for samples up to 5,000 but other researchers suggest that Shapiro-Wilk is too sensitive even lower (e.g., at 4,000 observations). Beyond 4,000-5,000 observations/total trials you should use visual inspection: flat reference lines (linearity, homogeneity of variance), dots along the line (normality of residuals and random effects), and points inside the contour lines (influential observations).
+
+</details>
+
+## Step 9: Interpret and visualize results
+
+### Interpreting the model output
+
+**Your turn:** print the results of `fit_final` with `summary()` (and
+`tab_model()` if you like). Then answer:
+
+1. **Research question:** does the MMN change with age? 
+2. What does the **intercept** mean? 
+3. What does the **DevNum_gmc** estimate mean? How much
+   does the MMN change over all 150 deviants? 
+4. Interpret each **random effect**: what does each SD tell you about
+   participants or tokens? 
+5. Why is the residual SD so large?
+
+```{r final-output-yourturn}
+
+```
+
+**Solution / catch up:** run this chunk either way (click **Code** to see it).
+
+```{r final-output-solution, class.source = "fold-hide"}
+summary(fit_final)
+tab_model(fit_final)
+
+b        <- fixef(fit_final)
+vc_subj  <- VarCorr(fit_final)$SubjectID
+sd_mmn   <- attr(vc_subj, "stddev")[["(Intercept)"]]
+sd_hab   <- attr(vc_subj, "stddev")[["DevNum_gmc"]]
+cor_mh   <- attr(vc_subj, "correlation")[1, 2]
+sd_token <- attr(VarCorr(fit_final)$Token, "stddev")[["(Intercept)"]]
+sd_resid <- sigma(fit_final)
+coefs    <- summary(fit_final)$coefficients
+```
+
+<details>
+<summary>Show answer</summary>
+
+**Fixed effects**
+
+- **Age_gmc = `r round(b[["Age_gmc"]], 2)` µV:** the change in the MMN per year
+  of age (simulated: `r age_effect` µV; p = `r round(coefs["Age_gmc", "Pr(>|t|)"], 2)`).
+  This answers our research question: there's no evidence that the MMN changes
+  with age here. Age is a participant-level predictor tested against only
+  `r n_subjects` participants (df ≈ `r round(coefs["Age_gmc", "df"])`), so a
+  modest age effect is hard to detect.
+- **(Intercept) = `r round(b[["(Intercept)"]], 2)` µV:** the MMN in the middle of the
+  session for a participant of average age (simulated: `r mmn_effect` µV). Look at
+  its df (≈ `r round(coefs["(Intercept)", "df"])`): the average MMN has to
+  generalize across participants *and* across the `r n_tokens` tokens, so with
+  few tokens, its df is small (like the actors in Example 1).
+- **DevNum_gmc = `r round(b[["DevNum_gmc"]], 2)` µV:** the MMN becomes
+  `r round(b[["DevNum_gmc"]], 2)` µV less negative with every 10 deviants
+  (simulated: `r hab_effect`), so it weakens over the session (habituation).
+  Over all `r n_deviant` deviants, that's about
+  `r round(b[["DevNum_gmc"]] * n_deviant / 10, 1)` µV. Its df is about
+  `r round(coefs["DevNum_gmc", "df"])`: with a random slope, habituation is
+  tested against how much participants differ in it.
+
+**Random effects**
+
+- **Participants' MMN, SD = `r round(sd_mmn, 2)` µV** (simulated: `r subject_mmn_sd`):
+  participants' MMNs typically differ from the average by about
+  `r round(sd_mmn, 1)` µV. About `r round(100 * pnorm(0, mean = b[["(Intercept)"]], sd = sd_mmn))`%
+  of participants are expected to show an MMN (a negative difference) in the
+  middle of the session.
+- **Participants' habituation, SD = `r round(sd_hab, 2)` µV per 10 deviants**
+  (simulated: `r subject_hab_sd`): some participants' MMNs fade quickly; others
+  barely change.
+- **Correlation = `r round(cor_mh, 2)`:** between participants' MMN and their
+  habituation (we simulated 0). With `r n_subjects` participants, this is
+  estimated imprecisely.
+- **Tokens, SD = `r round(sd_token, 2)` µV** (simulated: `r token_sd`): some /da/
+  recordings/speakers elicit a larger MMN than others.
+- **Residual SD = `r round(sd_resid, 2)` µV:** single-trial noise in the difference
+  wave (about √2 × `r trial_noise_sd` = `r round(sqrt(2) * trial_noise_sd, 1)` µV,
+  because each MMN contains the noise from two trials).
+
+</details>
+
+### Visualizing the results
+
+1. **The research question: the MMN across age.** Plot the model's estimated
+   marginal means across the observed age range, with each participant's mean
+   MMN as points. Hints: `emmeans(fit_final, ~ Age_gmc, at = list(Age_gmc =
+   age_grid), lmer.df = "asymptotic")`, where `age_grid` is a sequence of
+   centered ages; convert back to years with `+ age_grandmean`; use
+   `geom_ribbon()` for ± 1 SE.
+2. **Habituation, with each participant's line** (the random slope): 
+   `coef(fit_final)$SubjectID` gives each participant's own intercept and
+   slope.
+3. **Caterpillar plot:** a caterpillar plot of each participant's habituation slope
+   with a 95% interval. Hint: `as.data.frame(ranef(fit_final, condVar =
+   TRUE))` gives each random effect (`condval`) and its SD (`condsd`); add the
+   fixed effect back to get each participant's own slope.
+
+**Solution / catch up:** run this chunk either way (click **Code** to see it).
+
+```{r visualize-age-solution, class.source = "fold-hide"}
+# Model-estimated MMN across the observed age range (middle of the session), ± 1 SE
+age_grid <- seq(min(mmn_data$Age_gmc), max(mmn_data$Age_gmc), length.out = 25)
+emm_age <- emmeans(fit_final, ~ Age_gmc, at = list(Age_gmc = age_grid),
+                   lmer.df = "asymptotic")
+
+subject_age_means <- mmn_data %>%
+  group_by(SubjectID, AgeYears) %>%
+  summarise(MMN = mean(MMN), .groups = "drop")
+
+as.data.frame(emm_age) %>%
+  mutate(AgeYears = Age_gmc + age_grandmean) %>%          # back to years for the x-axis
+  ggplot(aes(x = AgeYears, y = emmean)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(data = subject_age_means, aes(y = MMN), color = "grey55", size = 2) +
+  geom_ribbon(aes(ymin = emmean - SE, ymax = emmean + SE), fill = "#0072B2", alpha = 0.25) +
+  geom_line(color = "#0072B2", linewidth = 1.3) +
+  theme_minimal() +
+  labs(x = "Age (years)", y = "MMN (µV)",
+       title = "The MMN across age",
+       subtitle = "Blue = EMM ± 1 SE (middle of the session); gray = each participant's mean MMN")
+```
+
+```{r visualize-habituation-solution, class.source = "fold-hide"}
+# Model-estimated MMN across the session (for a participant of average age), ± 1 SE
+dev_grid <- seq(min(mmn_data$DevNum_gmc), max(mmn_data$DevNum_gmc), length.out = 30)
+emm_dev <- emmeans(fit_final, ~ DevNum_gmc, at = list(DevNum_gmc = dev_grid),
+                   lmer.df = "asymptotic")
+
+# Each participant's model-estimated line (fixed effects + their random intercept and slope)
+subject_lines <- coef(fit_final)$SubjectID %>%
+  rownames_to_column("SubjectID") %>%
+  transmute(SubjectID, intercept = `(Intercept)`, slope = DevNum_gmc) %>%
+  crossing(x = range(mmn_data$DevNum_gmc)) %>%
+  mutate(MMN = intercept + slope * x)
+
+back_to_devnum <- function(x) x * 10 + mean(mmn_data$DevNum)   # back to 1-150 for the x-axis
+
+as.data.frame(emm_dev) %>%
+  ggplot(aes(x = back_to_devnum(DevNum_gmc), y = emmean)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_line(data = subject_lines, aes(x = back_to_devnum(x), y = MMN, group = SubjectID),
+            color = "grey75", linewidth = 0.4) +
+  geom_ribbon(aes(ymin = emmean - SE, ymax = emmean + SE), fill = "#D55E00", alpha = 0.25) +
+  geom_line(color = "#D55E00", linewidth = 1.3) +
+  theme_minimal() +
+  labs(x = "Deviant presentation number", y = "MMN (µV)",
+       title = "The MMN habituates over the session",
+       subtitle = "Orange = EMM ± 1 SE (average age); gray = each participant's model-estimated line")
+```
+
+```{r visualize-random-slopes-solution, fig.height=6, class.source = "fold-hide"}
+# Each participant's random intercept and slope, + the fixed effects = their own MMN and habituation slope
+subject_re_est <- as.data.frame(ranef(fit_final, condVar = TRUE)) %>%
+  filter(grpvar == "SubjectID") %>%
+  mutate(estimate = condval + fixef(fit_final)[as.character(term)],   # fixed effect + random effect
+         lower    = estimate - 1.96 * condsd,                          # 95% interval of each participant's estimate
+         upper    = estimate + 1.96 * condsd)
+
+hab_slopes <- subject_re_est %>%
+  filter(term == "DevNum_gmc") %>%
+  mutate(SubjectID = fct_reorder(grp, estimate))                      # order participants by their slope
+
+ggplot(hab_slopes, aes(x = estimate, y = SubjectID)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = fixef(fit_final)[["DevNum_gmc"]], color = "#D55E00", linewidth = 1) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0, color = "grey60") +
+  geom_point(color = "#3D6080", size = 2) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 7)) +
+  labs(x = "Habituation slope (change in MMN per 10 deviants, µV)", y = "Participant",
+       title = "Each participant's habituation slope (the by-participant random slope)",
+       subtitle = "Orange = fixed effect (average slope); dashed = no habituation; bars = 95% interval")
+```
+
+```{r visualize-random-slope-correlation-solution, fig.height=4.5, class.source = "fold-hide"}
+subject_re_est %>%
+  select(SubjectID = grp, term, estimate) %>%
+  pivot_wider(names_from = term, values_from = estimate) %>%
+  ggplot(aes(x = `(Intercept)`, y = DevNum_gmc)) +
+  geom_point(color = "#3D6080", size = 2.5, alpha = 0.8) +
+  theme_minimal() +
+  labs(x = "Participant's MMN (middle of the session, µV)",
+       y = "Participant's habituation slope (µV per 10 deviants)",
+       title = "Participants' MMN vs. their habituation",
+       subtitle = paste0("Each point = one participant; model correlation = ",
+                         round(attr(VarCorr(fit_final)$SubjectID, "correlation")[1, 2], 2)))
+```
+
+
+# Additional ideas to explore
+
+- **Fit Model B.** If you hypothesized that the habituation rate changes with
+  age, fit the second maximal model from Step 5 (`DevNum_gmc * Age_gmc`) and
+  simplify it with the same leave-one-out approach. Which term would you
+  remove first? Do you end up at the same random-effects structure?
+- **Change the simulation.** Go back to the design parameters, make the tokens
+  differ more (`token_sd`) or simulate fewer participants, and rerun
+  everything. Which simplification steps change?
+- **Model the standards and deviants directly.** The supplement
+  (`LME_ex2_supplement_interaction.Rmd`) fits the same pairs as a Condition ×
+  Age interaction and compares the two approaches.
+
+# About these materials
+
+These materials were developed for the Society for Psychophysiological
+Research pre-conference workshop "Linear mixed effects models for
+event-related potential research" (October 14, 2026, Halifax, Canada) by
+Megan J. Heise.
+
+Heise, M. J. (2026, October 14). *Linear mixed effects
+models for event-related potential research* [Workshop materials]. Society
+for Psychophysiological Research Annual Meeting, Halifax, Nova Scotia, Canada.
+
+# References
+
+Barr, D. J., Levy, R., Scheepers, C., & Tily, H. J. (2013). Random effects
+structure for confirmatory hypothesis testing: Keep it maximal. *Journal of
+Memory and Language, 68*(3), 255–278.
+
+Coy, N., Bendixen, A., Grimm, S., Roeber, U., & Schröger, E. (2024).
+Conditional deviant repetition in the oddball paradigm modulates processing
+at the level of P3a but not MMN. *Psychophysiology, 61*, e14545.
+https://doi.org/10.1111/psyp.14545
+
+Heise, M. J., Mon, S. K., & Bowman, L. C. (2022). Utility of linear mixed
+effects models for event-related potential research with infants and children.
+*Developmental Cognitive Neuroscience, 54*, 101070.
+https://doi.org/10.1016/j.dcn.2022.101070
+
+Heise, M. J., Mon, S. K., & Bowman, L. C. (2025). Analysis of event-related
+potential difference waves can benefit from linear mixed effects modeling:
+Recommendations for analyses and general model fitting. *Developmental
+Cognitive Neuroscience, 76*, 101614. https://doi.org/10.1016/j.dcn.2025.101614
+
+Mon, S. K., Manning, B. L., Wakschlag, L. S., & Norton, E. S. (2024).
+Leveraging mixed-effects location scale models to assess the ERP mismatch
+negativity's psychometric properties and trial-by-trial neural variability in
+toddler-mother dyads. *Developmental Cognitive Neuroscience, 70*, 101459.
